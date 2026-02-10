@@ -3,7 +3,11 @@
 use crate::{
   constants::NUM_CHALLENGE_BITS,
   errors::NovaError,
-  neutron::{relation::{FoldedInstance, FoldedWitness, Structure}, weight_table::WeightTable},
+  neutron::{
+    relation::{FoldedInstance, FoldedWitness, Structure},
+    sumcheck::{prove_helper, EvalAcc},
+    weight_table::WeightTable,
+  },
   r1cs::{R1CSInstance, R1CSWitness},
   spartan::polys::{power::PowPolynomial, univariate::UniPoly},
   traits::{AbsorbInRO2Trait, Engine, RO2Constants, ROTrait},
@@ -11,7 +15,6 @@ use crate::{
 };
 use ff::Field;
 use rand_core::OsRng;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// An NIFS message from NeutronNova's folding scheme
@@ -24,167 +27,6 @@ pub struct NIFS<E: Engine> {
 }
 
 impl<E: Engine> NIFS<E> {
-  /// Computes the evaluations of the sum-check polynomial at 0, 2, 3, and 4
-  #[inline]
-  fn prove_helper(
-    rho: &E::Scalar,
-    (left, right): (usize, usize),
-    e1: &[E::Scalar],
-    Az1: &[E::Scalar],
-    Bz1: &[E::Scalar],
-    Cz1: &[E::Scalar],
-    e2: &[E::Scalar],
-    Az2: &[E::Scalar],
-    Bz2: &[E::Scalar],
-    Cz2: &[E::Scalar],
-  ) -> (E::Scalar, E::Scalar, E::Scalar, E::Scalar, E::Scalar) {
-    // sanity check sizes
-    assert_eq!(e1.len(), left + right);
-    assert_eq!(Az1.len(), left * right);
-    assert_eq!(Bz1.len(), left * right);
-    assert_eq!(Cz1.len(), left * right);
-    assert_eq!(e2.len(), left + right);
-    assert_eq!(Az2.len(), left * right);
-    assert_eq!(Bz2.len(), left * right);
-    assert_eq!(Cz2.len(), left * right);
-
-    let comb_func = |c1: &E::Scalar, c2: &E::Scalar, c3: &E::Scalar, c4: &E::Scalar| -> E::Scalar {
-      *c1 * (*c2 * *c3 - *c4)
-    };
-    let (eval_at_0, eval_at_2, eval_at_3, eval_at_4, eval_at_5) = (0..right)
-      .into_par_iter()
-      .map(|i| {
-        let (i_eval_at_0, i_eval_at_2, i_eval_at_3, i_eval_at_4, i_eval_at_5) = (0..left)
-          .into_par_iter()
-          .map(|j| {
-            // Turn the two dimensional (i, j) into a single dimension index
-            let k = i * left + j;
-
-            // eval 0: bound_func is A(low)
-            let eval_point_0 = comb_func(&e1[j], &Az1[k], &Bz1[k], &Cz1[k]);
-
-            // eval 2: bound_func is -A(low) + 2*A(high)
-            let poly_e_bound_point = e2[j] + e2[j] - e1[j];
-            let poly_Az_bound_point = Az2[k] + Az2[k] - Az1[k];
-            let poly_Bz_bound_point = Bz2[k] + Bz2[k] - Bz1[k];
-            let poly_Cz_bound_point = Cz2[k] + Cz2[k] - Cz1[k];
-            let eval_point_2 = comb_func(
-              &poly_e_bound_point,
-              &poly_Az_bound_point,
-              &poly_Bz_bound_point,
-              &poly_Cz_bound_point,
-            );
-
-            // eval 3: bound_func is -2A(low) + 3A(high); computed incrementally with bound_func applied to eval(2)
-            let poly_e_bound_point = poly_e_bound_point + e2[j] - e1[j];
-            let poly_Az_bound_point = poly_Az_bound_point + Az2[k] - Az1[k];
-            let poly_Bz_bound_point = poly_Bz_bound_point + Bz2[k] - Bz1[k];
-            let poly_Cz_bound_point = poly_Cz_bound_point + Cz2[k] - Cz1[k];
-            let eval_point_3 = comb_func(
-              &poly_e_bound_point,
-              &poly_Az_bound_point,
-              &poly_Bz_bound_point,
-              &poly_Cz_bound_point,
-            );
-
-            // eval 4: bound_func is -3A(low) + 4A(high); computed incrementally with bound_func applied to eval(3)
-            let poly_e_bound_point = poly_e_bound_point + e2[j] - e1[j];
-            let poly_Az_bound_point = poly_Az_bound_point + Az2[k] - Az1[k];
-            let poly_Bz_bound_point = poly_Bz_bound_point + Bz2[k] - Bz1[k];
-            let poly_Cz_bound_point = poly_Cz_bound_point + Cz2[k] - Cz1[k];
-            let eval_point_4 = comb_func(
-              &poly_e_bound_point,
-              &poly_Az_bound_point,
-              &poly_Bz_bound_point,
-              &poly_Cz_bound_point,
-            );
-
-            // eval 5: bound_func is -4A(low) + 5A(high); computed incrementally with bound_func applied to eval(4)
-            let poly_e_bound_point = poly_e_bound_point + e2[j] - e1[j];
-            let poly_Az_bound_point = poly_Az_bound_point + Az2[k] - Az1[k];
-            let poly_Bz_bound_point = poly_Bz_bound_point + Bz2[k] - Bz1[k];
-            let poly_Cz_bound_point = poly_Cz_bound_point + Cz2[k] - Cz1[k];
-            let eval_point_5 = comb_func(
-              &poly_e_bound_point,
-              &poly_Az_bound_point,
-              &poly_Bz_bound_point,
-              &poly_Cz_bound_point,
-            );
-
-            (
-              eval_point_0,
-              eval_point_2,
-              eval_point_3,
-              eval_point_4,
-              eval_point_5,
-            )
-          })
-          .reduce(
-            || {
-              (
-                E::Scalar::ZERO,
-                E::Scalar::ZERO,
-                E::Scalar::ZERO,
-                E::Scalar::ZERO,
-                E::Scalar::ZERO,
-              )
-            },
-            |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3, a.4 + b.4),
-          );
-
-        let f1 = &e1[left..];
-        let f2 = &e2[left..];
-
-        // eval 0: bound_func is A(low)
-        let eval_at_0 = f1[i] * i_eval_at_0;
-
-        // eval 2: bound_func is -A(low) + 2*A(high)
-        let poly_f_bound_point = f2[i] + f2[i] - f1[i];
-        let eval_at_2 = poly_f_bound_point * i_eval_at_2;
-
-        // eval 3: bound_func is -2A(low) + 3A(high); computed incrementally with bound_func applied to eval(2)
-        let poly_f_bound_point = poly_f_bound_point + f2[i] - f1[i];
-        let eval_at_3 = poly_f_bound_point * i_eval_at_3;
-
-        // eval 4: bound_func is -3A(low) + 4A(high); computed incrementally with bound_func applied to eval(3)
-        let poly_f_bound_point = poly_f_bound_point + f2[i] - f1[i];
-        let eval_at_4 = poly_f_bound_point * i_eval_at_4;
-
-        // eval 5: bound_func is -4A(low) + 5A(high); computed incrementally with bound_func applied to eval(4)
-        let poly_f_bound_point = poly_f_bound_point + f2[i] - f1[i];
-        let eval_at_5 = poly_f_bound_point * i_eval_at_5;
-
-        (eval_at_0, eval_at_2, eval_at_3, eval_at_4, eval_at_5)
-      })
-      .reduce(
-        || {
-          (
-            E::Scalar::ZERO,
-            E::Scalar::ZERO,
-            E::Scalar::ZERO,
-            E::Scalar::ZERO,
-            E::Scalar::ZERO,
-          )
-        },
-        |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3, a.4 + b.4),
-      );
-
-    // multiply by the common factors
-    let one_minus_rho = E::Scalar::ONE - rho;
-    let three_rho_minus_one = E::Scalar::from(3) * rho - E::Scalar::ONE;
-    let five_rho_minus_two = E::Scalar::from(5) * rho - E::Scalar::from(2);
-    let seven_rho_minus_three = E::Scalar::from(7) * rho - E::Scalar::from(3);
-    let nine_rho_minus_four = E::Scalar::from(9) * rho - E::Scalar::from(4);
-
-    (
-      eval_at_0 * one_minus_rho,
-      eval_at_2 * three_rho_minus_one,
-      eval_at_3 * five_rho_minus_two,
-      eval_at_4 * seven_rho_minus_three,
-      eval_at_5 * nine_rho_minus_four,
-    )
-  }
-
   /// Takes as input a folded instance-witness tuple `(U1, W1)` and
   /// an R1CS instance-witness tuple `(U2, W2)` with a compatible structure `shape`
   /// and defined with respect to the same `ck`, and outputs
@@ -249,18 +91,19 @@ impl<E: Engine> NIFS<E> {
     let (Az2, Bz2, Cz2) = res2?;
 
     // compute the sum-check polynomial's evaluations at 0, 2, 3
-    let (eval_point_0, eval_point_2, eval_point_3, eval_point_4, eval_point_5) = Self::prove_helper(
-      &rho,
-      (S.left, S.right),
-      W1.E.as_slice(),
-      &Az1,
-      &Bz1,
-      &Cz1,
-      E.as_slice(),
-      &Az2,
-      &Bz2,
-      &Cz2,
-    );
+    let (eval_point_0, eval_point_2, eval_point_3, eval_point_4, eval_point_5): EvalAcc<E::Scalar> =
+      prove_helper::<E>(
+        &rho,
+        (S.left, S.right),
+        W1.E.as_slice(),
+        &Az1,
+        &Bz1,
+        &Cz1,
+        E.as_slice(),
+        &Az2,
+        &Bz2,
+        &Cz2,
+      );
 
     let evals = vec![
       eval_point_0,
@@ -362,7 +205,6 @@ mod tests {
     spartan::{direct::DirectCircuit, snark::RelaxedR1CSSNARK},
     traits::{circuit::NonTrivialCircuit, snark::RelaxedR1CSSNARKTrait, Engine, RO2Constants},
   };
-  use ff::Field;
 
   fn execute_sequence<E: Engine>(
     ck: &CommitmentKey<E>,
@@ -525,6 +367,7 @@ mod benchmarks {
     traits::{commitment::CommitmentEngineTrait, snark::default_ck_hint, ROConstants},
   };
   use core::marker::PhantomData;
+  use rayon::prelude::*;
   use criterion::Criterion;
   use ff::PrimeField;
   use num_integer::Integer;
