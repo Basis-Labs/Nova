@@ -74,29 +74,32 @@ pub struct PowerCheckWitness<E: Engine> {
 }
 
 /// Folded PowerCheck instance (NSC_PC).
-/// Satisfies: T_pc = Σᵢ E_pc(i) · (g₁[i] - g₂[i]·g₃[i])
+/// Contains commitments to both the original PowerCheck witness and the new E.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct FoldedPowerCheckInstance<E: Engine> {
-  /// Commitment to folded power table. Equals FoldedInstance.comm_E.
-  pub comm_e: Commitment<E>,
-
   /// Accumulated error. Fresh: T_pc = 0.
   pub T_pc: E::Scalar,
 
-  /// Linearly folded: τ_fold = (1-r_b)·τ_old + r_b·τ_new
-  pub tau: E::Scalar,
+  /// Commitment to original PowerCheck witness (powers of original tau)
+  pub comm_w_pc: Commitment<E>,
 
-  /// Fiat-Shamir challenge for E_pc weights (derived AFTER absorbing comm_e).
-  /// NOT linearly folded - fresh each fold.
-  pub tau_pc: E::Scalar,
+  /// Commitment to new power table E (shared with main relation)
+  pub comm_e: Commitment<E>,
+
+  /// Original tau (linearly folded: τ_fold = (1-r_b)·τ_old + r_b·τ_new)
+  pub tau: E::Scalar,
 }
 
 /// Folded PowerCheck witness (NSC_PC).
+/// Contains both the original PowerCheck witness and the new E.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct FoldedPowerCheckWitness<E: Engine> {
-  /// Folded power table, shared with FoldedWitness.E via Arc.
+  /// Original PowerCheck witness (powers of original tau)
+  pub w_pc: WeightTable<E>,
+
+  /// New power table E (powers of fresh tau), shared with main relation
   pub e: WeightTable<E>,
 }
 
@@ -106,10 +109,10 @@ impl<E: Engine> FoldedPowerCheckInstance<E> {
     // Suppress unused warning - S is kept for API consistency
     let _ = S;
     Self {
-      comm_e: Commitment::<E>::default(),
       T_pc: E::Scalar::ZERO,
+      comm_w_pc: Commitment::<E>::default(),
+      comm_e: Commitment::<E>::default(),
       tau: E::Scalar::ZERO,
-      tau_pc: E::Scalar::ZERO,
     }
   }
 
@@ -118,16 +121,16 @@ impl<E: Engine> FoldedPowerCheckInstance<E> {
     &self,
     u2: &PowerCheckInstance<E>,
     r_b: &E::Scalar,
+    comm_e_new: &Commitment<E>,
     T_pc_out: &E::Scalar,
-    tau_pc_out: &E::Scalar,
   ) -> Self {
     let one_minus_r = E::Scalar::ONE - r_b;
 
     Self {
-      comm_e: self.comm_e * one_minus_r + u2.comm_e * *r_b,
       T_pc: *T_pc_out,
+      comm_w_pc: self.comm_w_pc * one_minus_r + u2.comm_e * *r_b,
+      comm_e: self.comm_e * one_minus_r + *comm_e_new * *r_b,
       tau: one_minus_r * self.tau + *r_b * u2.tau,
-      tau_pc: *tau_pc_out,
     }
   }
 }
@@ -136,23 +139,25 @@ impl<E: Engine> FoldedPowerCheckWitness<E> {
   /// Create a default witness
   pub fn default(S: &PowerCheckStructure) -> Self {
     Self {
+      w_pc: WeightTable::new(vec![E::Scalar::ZERO; S.left + S.right], E::Scalar::ZERO, S.left),
       e: WeightTable::new(vec![E::Scalar::ZERO; S.left + S.right], E::Scalar::ZERO, S.left),
     }
   }
 
   /// Fold the witness with a fresh witness
-  pub fn fold(&self, w2: &PowerCheckWitness<E>, r_b: &E::Scalar) -> Self {
+  pub fn fold(&self, w2: &PowerCheckWitness<E>, e_new: &WeightTable<E>, r_b: &E::Scalar) -> Self {
     Self {
-      e: self.e.fold(&w2.e, r_b),
+      w_pc: self.w_pc.fold(&w2.e, r_b),
+      e: self.e.fold(e_new, r_b),
     }
   }
 }
 
 impl<E: Engine> AbsorbInRO2Trait<E> for FoldedPowerCheckInstance<E> {
   fn absorb_in_ro2(&self, ro: &mut E::RO2) {
-    self.comm_e.absorb_in_ro2(ro);
     ro.absorb(self.T_pc);
+    self.comm_w_pc.absorb_in_ro2(ro);
+    self.comm_e.absorb_in_ro2(ro);
     ro.absorb(self.tau);
-    ro.absorb(self.tau_pc);
   }
 }

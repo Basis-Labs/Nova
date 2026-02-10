@@ -3,7 +3,10 @@
 use crate::{
   constants::NUM_CHALLENGE_BITS,
   errors::NovaError,
-  neutron::relation::{FoldedInstance, FoldedWitness, Structure},
+  neutron::{
+    relation::{FoldedInstance, FoldedWitness, Structure},
+    weight_table::WeightTable,
+  },
   r1cs::{R1CSInstance, R1CSWitness},
   spartan::polys::{power::PowPolynomial, univariate::UniPoly},
   traits::{commitment::CommitmentEngineTrait, AbsorbInRO2Trait, Engine, RO2Constants, ROTrait},
