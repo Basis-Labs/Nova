@@ -3,14 +3,11 @@
 use crate::{
   constants::NUM_CHALLENGE_BITS,
   errors::NovaError,
-  neutron::{
-    relation::{FoldedInstance, FoldedWitness, Structure},
-    weight_table::WeightTable,
-  },
+  neutron::{relation::{FoldedInstance, FoldedWitness, Structure}, weight_table::WeightTable},
   r1cs::{R1CSInstance, R1CSWitness},
   spartan::polys::{power::PowPolynomial, univariate::UniPoly},
-  traits::{commitment::CommitmentEngineTrait, AbsorbInRO2Trait, Engine, RO2Constants, ROTrait},
-  Commitment, CommitmentKey, CE,
+  traits::{AbsorbInRO2Trait, Engine, RO2Constants, ROTrait},
+  Commitment, CommitmentKey,
 };
 use ff::Field;
 use rand_core::OsRng;
@@ -223,9 +220,10 @@ impl<E: Engine> NIFS<E> {
     let tau = ro.squeeze(NUM_CHALLENGE_BITS, false);
 
     // compute a commitment to the eq polynomial
-    let E = PowPolynomial::new(&tau, S.ell).split_evals(S.left, S.right);
+    let E_vec = PowPolynomial::new(&tau, S.ell).split_evals(S.left, S.right);
     let r_E = E::Scalar::random(&mut OsRng);
-    let comm_E = CE::<E>::commit(ck, &E, &r_E);
+    let E = WeightTable::new(E_vec, r_E, S.left);
+    let comm_E: Commitment<E> = E.commit(ck);
 
     comm_E.absorb_in_ro2(&mut ro); // absorb the commitment in the NIFS
 
@@ -254,11 +252,11 @@ impl<E: Engine> NIFS<E> {
     let (eval_point_0, eval_point_2, eval_point_3, eval_point_4, eval_point_5) = Self::prove_helper(
       &rho,
       (S.left, S.right),
-      &W1.E,
+      W1.E.as_slice(),
       &Az1,
       &Bz1,
       &Cz1,
-      &E,
+      E.as_slice(),
       &Az2,
       &Bz2,
       &Cz2,
@@ -285,7 +283,7 @@ impl<E: Engine> NIFS<E> {
     let T_out = poly.evaluate(&r_b) * eq_rho_r_b.invert().unwrap(); // TODO: remove unwrap
 
     let U = U1.fold(U2, &comm_E, &r_b, &T_out)?;
-    let W = W1.fold(W2, &E, &r_E, &r_b)?;
+    let W = W1.fold(W2, &E, &r_b)?;
 
     // return the folded instance and witness
     Ok((Self { comm_E, poly }, (U, W)))
@@ -524,7 +522,7 @@ mod benchmarks {
     nova::nifs::NIFS as NovaNIFS,
     provider::Bn256EngineKZG,
     r1cs::{R1CSShape, SparseMatrix},
-    traits::{snark::default_ck_hint, ROConstants},
+    traits::{commitment::CommitmentEngineTrait, snark::default_ck_hint, ROConstants},
   };
   use core::marker::PhantomData;
   use criterion::Criterion;

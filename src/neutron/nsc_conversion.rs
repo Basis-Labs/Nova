@@ -32,9 +32,11 @@ pub struct NSCConversionOutput<E: Engine> {
   /// Commitment to E
   pub comm_E: Commitment<E>,
 
-  /// Matrix-vector products for fresh R1CS: Az, Bz, Cz
+  /// Matrix-vector product Az for fresh R1CS
   pub Az: Vec<E::Scalar>,
+  /// Matrix-vector product Bz for fresh R1CS
   pub Bz: Vec<E::Scalar>,
+  /// Matrix-vector product Cz for fresh R1CS
   pub Cz: Vec<E::Scalar>,
 
   /// Input ZC_PC converted to NSC_PC form (attaches new E)
@@ -79,7 +81,7 @@ pub fn convert_to_nsc<E: Engine>(
   let E = WeightTable::new(E_vec, r_E, S.left);
 
   // Step 5: Commit to E
-  let comm_E = E.commit(ck);
+  let comm_E: Commitment<E> = E.commit(ck);
 
   // Step 6: Absorb comm_E into transcript (for downstream challenges)
   comm_E.absorb_in_ro2(transcript);
