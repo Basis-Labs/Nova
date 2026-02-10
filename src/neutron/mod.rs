@@ -24,7 +24,9 @@ use serde::{Deserialize, Serialize};
 
 mod circuit;
 pub mod nifs;
+pub mod power_check_relation;
 pub mod relation;
+pub mod weight_table;
 
 use circuit::{NeutronAugmentedCircuit, NeutronAugmentedCircuitInputs};
 use nifs::NIFS;
