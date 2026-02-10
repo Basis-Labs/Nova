@@ -1,4 +1,4 @@
-//! Construction 3: Reduce zero-check to nested sum-check
+//! Construction 3: Convert zero-check to nested sum-check
 #![allow(non_snake_case)]
 use crate::{
   constants::NUM_CHALLENGE_BITS,
@@ -19,7 +19,7 @@ use crate::{
 use ff::Field;
 use rand_core::OsRng;
 
-/// Output of Construction 3: Zero-check reduction
+/// Output of Construction 3: Zero-check conversion
 ///
 /// Converts ZC × ZC_PC → NSC × NSC_PC × ZC_PC
 pub struct NSCConversionOutput<E: Engine> {
@@ -44,13 +44,13 @@ pub struct NSCConversionOutput<E: Engine> {
   pub fresh_pc: (PowerCheckInstance<E>, PowerCheckWitness<E>),
 }
 
-/// Construction 3: Reduce zero-check to nested sum-check
+/// Construction 3: Convert zero-check to nested sum-check
 ///
 /// Converts fresh ZC (R1CS) and existing ZC_PC (PowerCheck) instances
 /// into NSC and NSC_PC form, plus outputs a new fresh ZC_PC.
 ///
 /// Type signature: ZC × ZC_PC → NSC × NSC_PC × ZC_PC
-pub fn reduce_to_nsc<E: Engine>(
+pub fn convert_to_nsc<E: Engine>(
   ck: &CommitmentKey<E>,
   S: &Structure<E>,
   S_pc: &PowerCheckStructure,
@@ -64,9 +64,9 @@ pub fn reduce_to_nsc<E: Engine>(
   let (U2, W2) = zc;
   U2.absorb_in_ro2(transcript);
 
-  // Step 2: Absorb ZC_PC instance (PowerCheck commitment) into transcript
+  // Step 2: Absorb ZC_PC instance into transcript
   let (pc_inst, pc_wit) = zc_pc;
-  pc_inst.comm_e.absorb_in_ro2(transcript);
+  pc_inst.absorb_in_ro2(transcript);
 
   // Step 3: Squeeze τ from transcript
   let tau = transcript.squeeze(NUM_CHALLENGE_BITS, false);
@@ -91,21 +91,21 @@ pub fn reduce_to_nsc<E: Engine>(
   // Step 8: Convert input ZC_PC to NSC_PC form
   let nsc_pc_instance = FoldedPowerCheckInstance {
     T_pc: E::Scalar::ZERO,
-    comm_w_pc: pc_inst.comm_e,
-    comm_e: comm_E,
+    comm_witness: pc_inst.comm_powers,
+    comm_weights: comm_E,
     tau: pc_inst.tau,
   };
   let nsc_pc_witness = FoldedPowerCheckWitness {
-    w_pc: pc_wit.e.clone(),
-    e: E.clone(),
+    witness: pc_wit.powers.clone(),
+    weights: E.clone(),
   };
 
   // Step 9: Create fresh PowerCheck instance/witness (the hanging ZC_PC)
   let fresh_pc_instance = PowerCheckInstance {
-    comm_e: comm_E,
+    comm_powers: comm_E,
     tau,
   };
-  let fresh_pc_witness = PowerCheckWitness { e: E.clone() };
+  let fresh_pc_witness = PowerCheckWitness { powers: E.clone() };
 
   Ok(NSCConversionOutput {
     tau,
