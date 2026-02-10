@@ -4,6 +4,7 @@ use crate::{
   constants::NUM_CHALLENGE_BITS,
   errors::NovaError,
   neutron::{
+    power_check_relation::{FoldedPowerCheckInstance, FoldedPowerCheckWitness},
     relation::{FoldedInstance, FoldedWitness, Structure},
     sumcheck::{prove_helper, EvalAcc},
     weight_table::WeightTable,
@@ -15,6 +16,7 @@ use crate::{
 };
 use ff::Field;
 use rand_core::OsRng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// An NIFS message from NeutronNova's folding scheme
@@ -24,6 +26,126 @@ use serde::{Deserialize, Serialize};
 pub struct NIFS<E: Engine> {
   pub(crate) comm_E: Commitment<E>,
   pub(crate) poly: UniPoly<E::Scalar>,
+}
+
+/// Output of fold_nsc: folded NSC instance, witness, and cached matrix-vector products
+#[derive(Clone, Debug)]
+pub struct FoldedNSC<E: Engine> {
+  /// Folded NSC instance
+  pub instance: FoldedInstance<E>,
+  /// Folded NSC witness
+  pub witness: FoldedWitness<E>,
+  /// Folded Az = A·z vector (cached for next iteration)
+  pub Az: Vec<E::Scalar>,
+  /// Folded Bz = B·z vector (cached for next iteration)
+  pub Bz: Vec<E::Scalar>,
+  /// Folded Cz = C·z vector (cached for next iteration)
+  pub Cz: Vec<E::Scalar>,
+}
+
+/// Fold two vectors element-wise: v1 + r_b * (v2 - v1)
+///
+/// Uses optimized form that saves one multiplication per element
+/// compared to (1-r_b)*v1 + r_b*v2.
+fn fold_vec<F: Field>(v1: &[F], v2: &[F], r_b: &F) -> Vec<F> {
+  v1.par_iter()
+    .zip(v2.par_iter())
+    .map(|(a, b)| *a + *r_b * (*b - *a))
+    .collect()
+}
+
+/// Construction 4: Fold two NSC instances
+///
+/// Folds running NSC with fresh NSC (converted from ZC).
+/// All linear objects are combined using: running + r_b * (fresh - running)
+///
+/// Returns FoldedNSC containing the folded instance, witness, and cached Az/Bz/Cz
+/// for use in subsequent folding iterations.
+pub fn fold_nsc<E: Engine>(
+  nsc_running: (&FoldedInstance<E>, &FoldedWitness<E>),
+  nsc_fresh: (&FoldedInstance<E>, &FoldedWitness<E>),
+  abc_running: (&[E::Scalar], &[E::Scalar], &[E::Scalar]),
+  abc_fresh: (&[E::Scalar], &[E::Scalar], &[E::Scalar]),
+  r_b: &E::Scalar,
+  T_out: &E::Scalar,
+) -> FoldedNSC<E> {
+  let one_minus_r = E::Scalar::ONE - r_b;
+
+  // Fold instance
+  // Note: Commitments use (1-r_b)*a + r_b*b form (no subtraction trait)
+  // Scalars use a + r_b*(b-a) form (saves one multiplication)
+  let instance = FoldedInstance {
+    comm_W: nsc_running.0.comm_W * one_minus_r + nsc_fresh.0.comm_W * *r_b,
+    comm_E: nsc_running.0.comm_E * one_minus_r + nsc_fresh.0.comm_E * *r_b,
+    u: nsc_running.0.u + *r_b * (nsc_fresh.0.u - nsc_running.0.u),
+    X: nsc_running
+      .0
+      .X
+      .par_iter()
+      .zip(nsc_fresh.0.X.par_iter())
+      .map(|(x1, x2)| *x1 + *r_b * (*x2 - *x1))
+      .collect(),
+    T: *T_out,
+  };
+
+  // Fold witness
+  let W = nsc_running
+    .1
+    .W
+    .par_iter()
+    .zip(nsc_fresh.1.W.par_iter())
+    .map(|(w1, w2)| *w1 + *r_b * (*w2 - *w1))
+    .collect();
+  let r_W = nsc_running.1.r_W + *r_b * (nsc_fresh.1.r_W - nsc_running.1.r_W);
+  let E = nsc_running.1.E.fold(&nsc_fresh.1.E, r_b);
+  let witness = FoldedWitness::new(W, r_W, E);
+
+  // Fold Az/Bz/Cz (caching optimization - saves one sparse matmul per iteration)
+  let Az = fold_vec(abc_running.0, abc_fresh.0, r_b);
+  let Bz = fold_vec(abc_running.1, abc_fresh.1, r_b);
+  let Cz = fold_vec(abc_running.2, abc_fresh.2, r_b);
+
+  FoldedNSC {
+    instance,
+    witness,
+    Az,
+    Bz,
+    Cz,
+  }
+}
+
+/// Construction 4: Fold two NSC_PC (PowerCheck) instances
+///
+/// Folding equations:
+/// - witness_folded = running + r_b * (fresh - running)
+/// - comm_witness_folded = running + r_b * (fresh - running)
+/// - tau_folded = running + r_b * (fresh - running)
+/// - T_pc_folded = T_pc_out (from sumcheck, NOT linearly folded)
+///
+/// Note: E_pc weights are derived fresh from tau_pc via Fiat-Shamir, not folded.
+pub fn fold_nsc_pc<E: Engine>(
+  nsc_pc_running: (&FoldedPowerCheckInstance<E>, &FoldedPowerCheckWitness<E>),
+  nsc_pc_fresh: (&FoldedPowerCheckInstance<E>, &FoldedPowerCheckWitness<E>),
+  r_b: &E::Scalar,
+  T_pc_out: &E::Scalar,
+) -> (FoldedPowerCheckInstance<E>, FoldedPowerCheckWitness<E>) {
+  let one_minus_r = E::Scalar::ONE - r_b;
+
+  // Commitments use (1-r_b)*a + r_b*b form (no subtraction trait)
+  // Scalars use a + r_b*(b-a) form (saves one multiplication)
+  let instance = FoldedPowerCheckInstance {
+    T_pc: *T_pc_out,
+    comm_witness: nsc_pc_running.0.comm_witness * one_minus_r + nsc_pc_fresh.0.comm_witness * *r_b,
+    comm_weights: nsc_pc_running.0.comm_weights * one_minus_r + nsc_pc_fresh.0.comm_weights * *r_b,
+    tau: nsc_pc_running.0.tau + *r_b * (nsc_pc_fresh.0.tau - nsc_pc_running.0.tau),
+  };
+
+  let witness = FoldedPowerCheckWitness {
+    witness: nsc_pc_running.1.witness.fold(&nsc_pc_fresh.1.witness, r_b),
+    weights: nsc_pc_running.1.weights.fold(&nsc_pc_fresh.1.weights, r_b),
+  };
+
+  (instance, witness)
 }
 
 impl<E: Engine> NIFS<E> {
@@ -367,7 +489,6 @@ mod benchmarks {
     traits::{commitment::CommitmentEngineTrait, snark::default_ck_hint, ROConstants},
   };
   use core::marker::PhantomData;
-  use rayon::prelude::*;
   use criterion::Criterion;
   use ff::PrimeField;
   use num_integer::Integer;

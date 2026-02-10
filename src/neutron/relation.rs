@@ -30,7 +30,8 @@ pub struct Structure<E: Engine> {
 pub struct FoldedWitness<E: Engine> {
   /// Running witness of the main relation
   pub(crate) W: Vec<E::Scalar>,
-  r_W: E::Scalar,
+  /// Commitment randomness for W
+  pub(crate) r_W: E::Scalar,
 
   /// Weight table in tensor form [e₁ || e₂]
   pub(crate) E: WeightTable<E>,
@@ -117,6 +118,22 @@ impl<E: Engine> Structure<E> {
 }
 
 impl<E: Engine> FoldedWitness<E> {
+  /// Create a new FoldedWitness with the given components
+  pub fn new(W: Vec<E::Scalar>, r_W: E::Scalar, E: WeightTable<E>) -> Self {
+    Self { W, r_W, E }
+  }
+
+  /// Create a FoldedWitness from an R1CS witness and weight table
+  ///
+  /// This "lifts" a fresh R1CS witness to folded form for use in folding.
+  pub fn from_r1cs(w: &R1CSWitness<E>, E: WeightTable<E>) -> Self {
+    Self {
+      W: w.W.clone(),
+      r_W: w.r_W,
+      E,
+    }
+  }
+
   /// Create a default witness
   pub fn default(S: &Structure<E>) -> Self {
     FoldedWitness {
