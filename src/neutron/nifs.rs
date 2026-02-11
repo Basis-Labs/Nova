@@ -4,7 +4,7 @@ use crate::{
   constants::NUM_CHALLENGE_BITS,
   errors::NovaError,
   neutron::{
-    nsc_conversion::convert_to_nsc,
+    nsc::convert_to_nsc,
     power_check_relation::{
       FoldedPowerCheckInstance, FoldedPowerCheckWitness, PowerCheckInstance, PowerCheckStructure,
       PowerCheckWitness,
@@ -334,6 +334,14 @@ impl<E: Engine> NIFS<E> {
     ];
     let poly = UniPoly::<E::Scalar>::from_evals(&evals);
 
+    // === ASSERT: Sumcheck Identity ===
+    // poly(0) + poly(1) = (1-ρ)·T_running + ρ·T_fresh where T_fresh = 0
+    assert_eq!(
+      poly.eval_at_zero() + poly.eval_at_one(),
+      T,
+      "Sumcheck identity violated: poly(0) + poly(1) ≠ (1-ρ)·T_running"
+    );
+
     // absorb poly in the RO
     <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly, &mut ro);
 
@@ -345,6 +353,14 @@ impl<E: Engine> NIFS<E> {
     let eq_rho_r_b_inv: E::Scalar =
       Option::from(eq_rho_r_b.invert()).ok_or(NovaError::DivideByZero)?;
     let T_out = poly.evaluate(&r_b) * eq_rho_r_b_inv;
+
+    // === ASSERT: Output Claim Consistency ===
+    // poly(r_b) = T_out · eq(ρ, r_b)
+    assert_eq!(
+      poly.evaluate(&r_b),
+      T_out * eq_rho_r_b,
+      "Output claim inconsistent: poly(r_b) ≠ T_out · eq(ρ, r_b)"
+    );
 
     let U = U1.fold(U2, &comm_E, &r_b, &T_out)?;
     let W = W1.fold(W2, &E, &r_b)?;
@@ -523,7 +539,7 @@ mod tests {
       solver::SatisfyingAssignment,
       Circuit, ConstraintSystem,
     },
-    neutron::power_check_relation::pc_residual_at,
+    neutron::nsc::{pc_residual_at, verify_nsc_claim_bruteforce, verify_nsc_pc_claim_bruteforce},
     provider::{
       hyperkzg::EvaluationEngine as HyperKZGEE, ipa_pc::EvaluationEngine, Bn256EngineKZG,
       PallasEngine, Secp256k1Engine,
@@ -536,81 +552,6 @@ mod tests {
   // ============================================================================
   // Test Verification Helpers
   // ============================================================================
-
-  /// Brute-force verify the NSC sumcheck claim
-  /// sum = Σᵢ E[i] · (Az[i]·Bz[i] - Cz[i]) should equal U.T
-  fn verify_nsc_claim_bruteforce<E: Engine>(
-    S: &Structure<E>,
-    U: &FoldedInstance<E>,
-    W: &FoldedWitness<E>,
-  ) -> Result<(), NovaError> {
-    // Compute z = [W, u, X]
-    let z = [W.W.clone(), vec![U.u], U.X.clone()].concat();
-    let (Az, Bz, Cz) = S.S.multiply_vec(&z)?;
-
-    // Compute full E (outer product of E1 and E2)
-    let (E1, E2) = (W.E.e1(), W.E.e2());
-    let mut full_E = vec![E::Scalar::ZERO; S.left * S.right];
-    for i in 0..S.right {
-      for j in 0..S.left {
-        full_E[i * S.left + j] = E2[i] * E1[j];
-      }
-    }
-
-    // Compute weighted sum
-    let sum: E::Scalar = full_E
-      .iter()
-      .zip(Az.iter())
-      .zip(Bz.iter())
-      .zip(Cz.iter())
-      .map(|(((e, a), b), c)| *e * (*a * *b - *c))
-      .fold(E::Scalar::ZERO, |acc, x| acc + x);
-
-    if sum != U.T {
-      return Err(NovaError::UnSat {
-        reason: format!(
-          "NSC claim mismatch: computed {:?} != claimed {:?}",
-          sum, U.T
-        ),
-      });
-    }
-    Ok(())
-  }
-
-  /// Brute-force verify the NSC_PC sumcheck claim
-  /// pc_sumcheck_claim = Σᵢ E_pc[i] · pc_residual_at(i) should equal U.pc_sumcheck_claim
-  fn verify_nsc_pc_claim_bruteforce<E: Engine>(
-    S_pc: &PowerCheckStructure,
-    U: &FoldedPowerCheckInstance<E>,
-    W: &FoldedPowerCheckWitness<E>,
-  ) -> Result<(), NovaError> {
-    let e1 = W.witness.e1();
-    let e2 = W.witness.e2();
-    let w_left = W.weights.e1();
-    let w_right = W.weights.e2();
-    let tau = U.tau;
-    let left = S_pc.left; // Main relation's left (also used for weight indexing)
-
-    // pc_sumcheck_claim = Σᵢ weight(i) · residual(i)
-    let sum: E::Scalar = (0..S_pc.num_cons)
-      .map(|i| {
-        let residual = pc_residual_at(i, left, e1, e2, tau);
-        let row = i / left;
-        let col = i % left;
-        w_right[row] * w_left[col] * residual
-      })
-      .fold(E::Scalar::ZERO, |acc, x| acc + x);
-
-    if sum != U.pc_sumcheck_claim {
-      return Err(NovaError::UnSat {
-        reason: format!(
-          "NSC_PC claim mismatch: computed {:?} != claimed {:?}",
-          sum, U.pc_sumcheck_claim
-        ),
-      });
-    }
-    Ok(())
-  }
 
   /// Verify that fresh ZC_PC has all residuals = 0
   fn verify_zc_pc_valid<E: Engine>(

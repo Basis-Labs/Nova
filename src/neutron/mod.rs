@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 mod circuit;
 pub mod nifs;
-pub mod nsc_conversion;
+pub mod nsc;
 pub mod power_check_relation;
 pub mod relation;
 pub mod sumcheck;

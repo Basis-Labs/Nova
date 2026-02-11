@@ -117,3 +117,102 @@ pub fn convert_to_nsc<E: Engine>(
     fresh_pc: (fresh_pc_instance, fresh_pc_witness),
   })
 }
+
+// ============================================================================
+// Test Verification Helpers
+// ============================================================================
+
+#[cfg(test)]
+use super::power_check_relation::{pc_g_at, PowerCheckStructure};
+
+/// Compute residual F_PC = g₁ - g₂·g₃ at index i.
+///
+/// For a valid power table, all residuals are zero.
+/// For a corrupted table, at least one residual will be non-zero.
+#[cfg(test)]
+pub(crate) fn pc_residual_at<F: Field>(i: usize, left: usize, e1: &[F], e2: &[F], tau: F) -> F {
+  debug_assert!(
+    i < left + e2.len(),
+    "PC constraint index {i} out of bounds (num_cons = {})",
+    left + e2.len()
+  );
+  let (g1, g2, g3) = pc_g_at(i, left, e1, e2, tau);
+  g1 - g2 * g3
+}
+
+/// Brute-force verify the NSC sumcheck claim
+/// sum = Σᵢ E[i] · (Az[i]·Bz[i] - Cz[i]) should equal U.T
+#[cfg(test)]
+pub(crate) fn verify_nsc_claim_bruteforce<E: Engine>(
+  S: &Structure<E>,
+  U: &FoldedInstance<E>,
+  W: &FoldedWitness<E>,
+) -> Result<(), NovaError> {
+  // Compute z = [W, u, X]
+  let z = [W.W.clone(), vec![U.u], U.X.clone()].concat();
+  let (Az, Bz, Cz) = S.S.multiply_vec(&z)?;
+
+  // Compute full E (outer product of E1 and E2)
+  let (E1, E2) = (W.E.e1(), W.E.e2());
+  let mut full_E = vec![E::Scalar::ZERO; S.left * S.right];
+  for i in 0..S.right {
+    for j in 0..S.left {
+      full_E[i * S.left + j] = E2[i] * E1[j];
+    }
+  }
+
+  // Compute weighted sum
+  let sum: E::Scalar = full_E
+    .iter()
+    .zip(Az.iter())
+    .zip(Bz.iter())
+    .zip(Cz.iter())
+    .map(|(((e, a), b), c)| *e * (*a * *b - *c))
+    .fold(E::Scalar::ZERO, |acc, x| acc + x);
+
+  if sum != U.T {
+    return Err(NovaError::UnSat {
+      reason: format!(
+        "NSC claim mismatch: computed {:?} != claimed {:?}",
+        sum, U.T
+      ),
+    });
+  }
+  Ok(())
+}
+
+/// Brute-force verify the NSC_PC sumcheck claim
+/// pc_sumcheck_claim = Σᵢ E_pc[i] · pc_residual_at(i) should equal U.pc_sumcheck_claim
+#[cfg(test)]
+pub(crate) fn verify_nsc_pc_claim_bruteforce<E: Engine>(
+  S_pc: &PowerCheckStructure,
+  U: &FoldedPowerCheckInstance<E>,
+  W: &FoldedPowerCheckWitness<E>,
+) -> Result<(), NovaError> {
+  let e1 = W.witness.e1();
+  let e2 = W.witness.e2();
+  let w_left = W.weights.e1();
+  let w_right = W.weights.e2();
+  let tau = U.tau;
+  let left = S_pc.left; // Main relation's left (also used for weight indexing)
+
+  // pc_sumcheck_claim = Σᵢ weight(i) · residual(i)
+  let sum: E::Scalar = (0..S_pc.num_cons)
+    .map(|i| {
+      let residual = pc_residual_at(i, left, e1, e2, tau);
+      let row = i / left;
+      let col = i % left;
+      w_right[row] * w_left[col] * residual
+    })
+    .fold(E::Scalar::ZERO, |acc, x| acc + x);
+
+  if sum != U.pc_sumcheck_claim {
+    return Err(NovaError::UnSat {
+      reason: format!(
+        "NSC_PC claim mismatch: computed {:?} != claimed {:?}",
+        sum, U.pc_sumcheck_claim
+      ),
+    });
+  }
+  Ok(())
+}

@@ -306,21 +306,6 @@ pub fn pc_g_at<F: Field>(
   (g1, g2, g3)
 }
 
-/// Compute residual F_PC = g₁ - g₂·g₃ at index i.
-///
-/// For a valid power table, all residuals are zero.
-/// For a corrupted table, at least one residual will be non-zero.
-#[inline(always)]
-pub fn pc_residual_at<F: Field>(i: usize, left: usize, e1: &[F], e2: &[F], tau: F) -> F {
-  debug_assert!(
-    i < left + e2.len(),
-    "PC constraint index {i} out of bounds (num_cons = {})",
-    left + e2.len()
-  );
-  let (g1, g2, g3) = pc_g_at(i, left, e1, e2, tau);
-  g1 - g2 * g3
-}
-
 /// Brute-force computation of PowerCheck weighted sum for testing.
 /// Computes: pc_sumcheck_claim = Σᵢ w_right[row] · w_left[col] · (g₁[i] - g₂[i]·g₃[i])
 ///
@@ -359,7 +344,10 @@ pub(crate) fn compute_pc_weighted_sum_bruteforce<F: Field>(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{provider::Bn256EngineKZG, r1cs::R1CSShape, spartan::polys::power::PowPolynomial};
+  use crate::{
+    neutron::nsc::pc_residual_at, provider::Bn256EngineKZG, r1cs::R1CSShape,
+    spartan::polys::power::PowPolynomial,
+  };
   use ff::Field;
   use rand::{rngs::StdRng, RngCore, SeedableRng};
 

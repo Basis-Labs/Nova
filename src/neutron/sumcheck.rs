@@ -253,6 +253,14 @@ pub fn run_combined_sumfold<E: Engine>(
   );
   let poly_nsc = build_sumcheck_poly(evals_nsc, sumcheck_claim_nsc);
 
+  // === ASSERT: NSC Sumcheck Identity ===
+  // poly_nsc(0) + poly_nsc(1) = (1-ρ)·T_running + ρ·T_fresh where T_fresh = 0
+  assert_eq!(
+    poly_nsc.eval_at_zero() + poly_nsc.eval_at_one(),
+    sumcheck_claim_nsc,
+    "NSC sumcheck identity violated: poly_nsc(0) + poly_nsc(1) ≠ (1-ρ)·T_running"
+  );
+
   // Step 4: Run NSC_PC sumcheck
   let evals_pc: EvalAcc<E::Scalar> = prove_helper_pc::<E>(
     rho,
@@ -266,11 +274,28 @@ pub fn run_combined_sumfold<E: Engine>(
   );
   let poly_pc = build_sumcheck_poly(evals_pc, sumcheck_claim_pc);
 
+  // === ASSERT: NSC_PC Sumcheck Identity ===
+  // poly_pc(0) + poly_pc(1) = (1-ρ)·T_pc_running + ρ·T_pc_fresh where T_pc_fresh = 0
+  assert_eq!(
+    poly_pc.eval_at_zero() + poly_pc.eval_at_one(),
+    sumcheck_claim_pc,
+    "NSC_PC sumcheck identity violated: poly_pc(0) + poly_pc(1) ≠ (1-ρ)·T_pc_running"
+  );
+
   // Step 5: Combine with γ: poly = poly_nsc + γ·poly_pc
   let poly = {
     let poly_pc_scaled = poly_pc.scaled(&gamma);
     poly_nsc.add(&poly_pc_scaled)
   };
+
+  // === ASSERT: Combined Sumcheck Identity ===
+  // poly(0) + poly(1) = T_nsc + γ·T_pc
+  let combined_claim = sumcheck_claim_nsc + gamma * sumcheck_claim_pc;
+  assert_eq!(
+    poly.eval_at_zero() + poly.eval_at_one(),
+    combined_claim,
+    "Combined sumcheck identity violated: poly(0) + poly(1) ≠ T_nsc + γ·T_pc"
+  );
 
   // Step 6: Absorb combined poly, squeeze r_b
   <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly, transcript);
@@ -283,6 +308,30 @@ pub fn run_combined_sumfold<E: Engine>(
 
   let sumcheck_claim_out_nsc = poly_nsc.evaluate(&r_b) * eq_rho_r_b_inv;
   let sumcheck_claim_out_pc = poly_pc.evaluate(&r_b) * eq_rho_r_b_inv;
+
+  // === ASSERT: NSC Output Claim Consistency ===
+  // poly_nsc(r_b) = T_out_nsc · eq(ρ, r_b)
+  assert_eq!(
+    poly_nsc.evaluate(&r_b),
+    sumcheck_claim_out_nsc * eq_rho_r_b,
+    "NSC output claim inconsistent: poly_nsc(r_b) ≠ T_out_nsc · eq(ρ, r_b)"
+  );
+
+  // === ASSERT: NSC_PC Output Claim Consistency ===
+  // poly_pc(r_b) = T_out_pc · eq(ρ, r_b)
+  assert_eq!(
+    poly_pc.evaluate(&r_b),
+    sumcheck_claim_out_pc * eq_rho_r_b,
+    "NSC_PC output claim inconsistent: poly_pc(r_b) ≠ T_out_pc · eq(ρ, r_b)"
+  );
+
+  // === ASSERT: Combined Polynomial Decomposition at r_b ===
+  // poly(r_b) = poly_nsc(r_b) + γ·poly_pc(r_b)
+  assert_eq!(
+    poly.evaluate(&r_b),
+    poly_nsc.evaluate(&r_b) + gamma * poly_pc.evaluate(&r_b),
+    "Combined polynomial decomposition violated at r_b"
+  );
 
   Ok(CombinedSumcheckOutput {
     poly,
