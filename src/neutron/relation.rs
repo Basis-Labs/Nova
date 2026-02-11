@@ -139,7 +139,11 @@ impl<E: Engine> FoldedWitness<E> {
     FoldedWitness {
       W: vec![E::Scalar::ZERO; S.S.num_vars],
       r_W: E::Scalar::ZERO,
-      E: WeightTable::new(vec![E::Scalar::ZERO; S.left + S.right], E::Scalar::ZERO, S.left),
+      E: WeightTable::new(
+        vec![E::Scalar::ZERO; S.left + S.right],
+        E::Scalar::ZERO,
+        S.left,
+      ),
     }
   }
 

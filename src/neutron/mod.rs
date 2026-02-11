@@ -29,6 +29,7 @@ pub mod power_check_relation;
 pub mod relation;
 pub mod sumcheck;
 pub mod weight_table;
+pub mod zerofold_nifs;
 
 use circuit::{NeutronAugmentedCircuit, NeutronAugmentedCircuitInputs};
 use nifs::NIFS;

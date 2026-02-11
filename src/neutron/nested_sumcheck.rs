@@ -358,26 +358,29 @@ mod tests {
     )
     .expect("convert_to_nsc should succeed");
 
+    let (nsc_instance, nsc_witness) = output.nsc;
+    let (nsc_pc_instance, nsc_pc_witness) = output.nsc_pc;
+
     // Verify NSC claim is zero
     assert_eq!(
-      output.nsc.0.T,
+      nsc_instance.T,
       <E as Engine>::Scalar::ZERO,
       "NSC instance T should be zero"
     );
 
     // Verify NSC_PC claim is zero
     assert_eq!(
-      output.nsc_pc.0.pc_sumcheck_claim,
+      nsc_pc_instance.pc_sumcheck_claim,
       <E as Engine>::Scalar::ZERO,
       "NSC_PC instance pc_sumcheck_claim should be zero"
     );
 
     // Verify NSC claim via brute-force computation
-    verify_nsc_claim_bruteforce::<E>(&str, &output.nsc.0, &output.nsc.1)
+    verify_nsc_claim_bruteforce::<E>(&str, &nsc_instance, &nsc_witness)
       .expect("NSC brute-force verification should pass");
 
     // Verify NSC_PC claim via brute-force computation
-    verify_nsc_pc_claim_bruteforce::<E>(&S_pc, &output.nsc_pc.0, &output.nsc_pc.1)
+    verify_nsc_pc_claim_bruteforce::<E>(&S_pc, &nsc_pc_instance, &nsc_pc_witness)
       .expect("NSC_PC brute-force verification should pass");
   }
 }

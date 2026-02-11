@@ -234,13 +234,15 @@ pub fn sumcheck_round<F: PrimeField + CustomSerdeTrait>(
 
 /// Output of combined NSC + NSC_PC sumcheck (Construction 4)
 ///
-/// Per NeutronNova paper: The proof consists of a SINGLE combined polynomial
-/// `poly = poly_nsc + γ·poly_pc` where γ is a random challenge.
+/// Contains two separate sumcheck polynomials for independent verification.
+/// The γ challenge is still used for transcript binding (Fiat-Shamir).
 #[derive(Clone, Debug)]
 pub struct CombinedSumcheckOutput<E: Engine> {
-  /// Combined polynomial: poly_nsc + γ·poly_pc (the actual proof)
-  pub poly: UniPoly<E::Scalar>,
-  /// γ challenge used for combination
+  /// NSC sumcheck polynomial
+  pub poly_nsc: UniPoly<E::Scalar>,
+  /// PowerCheck sumcheck polynomial
+  pub poly_pc: UniPoly<E::Scalar>,
+  /// γ challenge used for transcript binding
   pub gamma: E::Scalar,
   /// Folding challenge r_b
   pub r_b: E::Scalar,
@@ -327,18 +329,20 @@ pub fn run_combined_sumfold<E: Engine>(
   // Verify NSC_PC sumcheck identity: poly_pc(0) + poly_pc(1) = claim
   verify_sumcheck_identity(&poly_pc, &sumcheck_claim_pc)?;
 
-  // Step 5: Combine with γ: poly = poly_nsc + γ·poly_pc
-  let poly = {
+  // Step 5: Combine with γ for transcript binding (Fiat-Shamir)
+  // The combined polynomial binds both polynomials to the transcript,
+  // but we return individual polynomials in the proof for independent verification.
+  let poly_combined = {
     let poly_pc_scaled = poly_pc.scaled(&gamma);
     poly_nsc.add(&poly_pc_scaled)
   };
 
   // Verify combined sumcheck identity: poly(0) + poly(1) = T_nsc + γ·T_pc
   let combined_claim = sumcheck_claim_nsc + gamma * sumcheck_claim_pc;
-  verify_sumcheck_identity(&poly, &combined_claim)?;
+  verify_sumcheck_identity(&poly_combined, &combined_claim)?;
 
-  // Step 6: Absorb combined poly, squeeze r_b
-  <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly, transcript);
+  // Step 6: Absorb combined poly in transcript, squeeze r_b
+  <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly_combined, transcript);
   let r_b = transcript.squeeze(NUM_CHALLENGE_BITS, false);
 
   // Step 7: Compute output claims
@@ -354,10 +358,11 @@ pub fn run_combined_sumfold<E: Engine>(
   verify_output_claim_consistency(&poly_pc, &r_b, &sumcheck_claim_out_pc, &eq_rho_r_b)?;
 
   // Verify combined polynomial decomposition: poly(r_b) = poly_nsc(r_b) + γ·poly_pc(r_b)
-  verify_combined_poly_decomposition(&poly, &poly_nsc, &poly_pc, &gamma, &r_b)?;
+  verify_combined_poly_decomposition(&poly_combined, &poly_nsc, &poly_pc, &gamma, &r_b)?;
 
   Ok(CombinedSumcheckOutput {
-    poly,
+    poly_nsc,
+    poly_pc,
     gamma,
     r_b,
     sumcheck_claim_out_nsc,
