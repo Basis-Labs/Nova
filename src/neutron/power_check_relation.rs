@@ -74,6 +74,27 @@ pub struct PowerCheckWitness<E: Engine> {
   pub powers: WeightTable<E>,
 }
 
+/// Create a fresh ZC_PC (zero-check PowerCheck) instance and witness.
+///
+/// This is the entry point for creating a PowerCheck that verifies E is a valid power table.
+/// The returned instance/witness can then be converted to NSC_PC form via
+/// `FoldedPowerCheckInstance::from_fresh_zc_pc` and `FoldedPowerCheckWitness::from_fresh_zc_pc`.
+pub fn fresh_power_check<E: Engine>(
+  tau: &E::Scalar,
+  left: usize,
+  right: usize,
+  ck: &CommitmentKey<E>,
+) -> (PowerCheckInstance<E>, PowerCheckWitness<E>) {
+  let witness = PowerCheckWitness {
+    powers: WeightTable::from_tau(tau, left, right),
+  };
+  let instance = PowerCheckInstance {
+    comm_powers: witness.powers.commit(ck),
+    tau: *tau,
+  };
+  (instance, witness)
+}
+
 /// Folded PowerCheck instance (NSC_PC).
 /// Contains commitments to both the original PowerCheck witness and the new E.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

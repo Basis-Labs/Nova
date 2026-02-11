@@ -35,6 +35,22 @@ impl<E: Engine> WeightTable<E> {
     }
   }
 
+  /// Create a fresh power table [e₁ || e₂] from τ.
+  ///
+  /// - e₁ = [1, τ, τ², ..., τ^{left-1}]
+  /// - e₂ = [1, τ^left, τ^{2·left}, ..., τ^{(right-1)·left}]
+  ///
+  /// Commitment randomness is drawn from `OsRng` (must be secret for hiding).
+  pub fn from_tau(tau: &E::Scalar, left: usize, right: usize) -> Self {
+    use crate::spartan::polys::power::PowPolynomial;
+    use rand_core::OsRng;
+
+    let ell = ((left * right) as u32).ilog2() as usize;
+    let data = PowPolynomial::new(tau, ell).split_evals(left, right);
+    let r = E::Scalar::random(&mut OsRng);
+    Self::new(data, r, left)
+  }
+
   /// First half: e₁ = [1, τ, τ², ..., τ^{left-1}] (or folded version)
   pub fn e1(&self) -> &[E::Scalar] {
     &self.data[..self.left]

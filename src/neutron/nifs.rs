@@ -5,20 +5,19 @@ use crate::{
   errors::NovaError,
   neutron::{
     power_check_relation::{
-      FoldedPowerCheckInstance, FoldedPowerCheckWitness, PowerCheckInstance, PowerCheckStructure,
-      PowerCheckWitness,
+      fresh_power_check, FoldedPowerCheckInstance, FoldedPowerCheckWitness, PowerCheckInstance,
+      PowerCheckStructure, PowerCheckWitness,
     },
     relation::{FoldedInstance, FoldedWitness, Structure},
     sumcheck::{prove_helper, prove_helper_pc, EvalAcc},
     weight_table::WeightTable,
   },
   r1cs::{R1CSInstance, R1CSWitness},
-  spartan::polys::{power::PowPolynomial, univariate::UniPoly},
+  spartan::polys::univariate::UniPoly,
   traits::{AbsorbInRO2Trait, Engine, RO2Constants, ROTrait},
   Commitment, CommitmentKey,
 };
 use ff::Field;
-use rand_core::OsRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -286,9 +285,7 @@ impl<E: Engine> NIFS<E> {
     let tau = ro.squeeze(NUM_CHALLENGE_BITS, false);
 
     // compute a commitment to the eq polynomial
-    let E_vec = PowPolynomial::new(&tau, S.ell).split_evals(S.left, S.right);
-    let r_E = E::Scalar::random(&mut OsRng);
-    let E = WeightTable::new(E_vec, r_E, S.left);
+    let E = WeightTable::from_tau(&tau, S.left, S.right);
     let comm_E: Commitment<E> = E.commit(ck);
 
     comm_E.absorb_in_ro2(&mut ro); // absorb the commitment in the NIFS
@@ -447,16 +444,15 @@ impl<E: Engine> NIFS<E> {
     // Absorb fresh ZC_PC instance
     zc_pc_fresh.0.absorb_in_ro2(&mut ro);
 
-    // === PHASE 2: Generate τ and create E ===
+    // === PHASE 2: Generate τ and create fresh ZC_PC for E ===
     let tau = ro.squeeze(NUM_CHALLENGE_BITS, false);
 
-    // Create power polynomial E for BOTH main NSC and NSC_PC - dimensions (left, right)
-    // PowerCheck constraints (num_cons = left + right) are padded to main domain (left × right).
-    // The sumcheck skips indices >= num_cons.
-    let E_vec = PowPolynomial::new(&tau, S.ell).split_evals(S.left, S.right);
-    let r_E = E::Scalar::random(&mut OsRng);
-    let E = WeightTable::new(E_vec, r_E, S.left);
-    let comm_E: Commitment<E> = E.commit(ck);
+    // Create fresh ZC_PC (the hanging PowerCheck for E)
+    // E has dimensions (left × right) for BOTH main NSC and NSC_PC.
+    // PowerCheck constraints are padded; sumcheck skips indices >= num_cons.
+    let (new_zc_pc_instance, new_zc_pc_witness) = fresh_power_check(&tau, S.left, S.right, ck);
+    let E = new_zc_pc_witness.powers.clone();
+    let comm_E: Commitment<E> = new_zc_pc_instance.comm_powers;
 
     comm_E.absorb_in_ro2(&mut ro);
 
@@ -559,14 +555,8 @@ impl<E: Engine> NIFS<E> {
       &T_out_nsc_pc,
     );
 
-    // === PHASE 13: Create new ZC_PC (hanging check for next iteration) ===
-    let new_zc_pc_instance = PowerCheckInstance {
-      comm_powers: comm_E,
-      tau,
-    };
-    let new_zc_pc_witness = PowerCheckWitness { powers: E };
-
-    // === PHASE 14: Return combined output ===
+    // === PHASE 13: Return combined output ===
+    // Note: new_zc_pc was already created in PHASE 2
     Ok(NIFSCombinedOutput {
       nifs: NIFS {
         comm_E,
@@ -661,15 +651,14 @@ mod tests {
     let w_left = W.weights.e1();
     let w_right = W.weights.e2();
     let tau = U.tau;
-    let left = S_pc.left;
-    let left_pc = S_pc.left_pc;
+    let left = S_pc.left; // Main relation's left (also used for weight indexing)
 
     // pc_sumcheck_claim = Σᵢ weight(i) · residual(i)
     let sum: E::Scalar = (0..S_pc.num_cons)
       .map(|i| {
         let residual = pc_residual_at(i, left, e1, e2, tau);
-        let row = i / left_pc;
-        let col = i % left_pc;
+        let row = i / left;
+        let col = i % left;
         w_right[row] * w_left[col] * residual
       })
       .fold(E::Scalar::ZERO, |acc, x| acc + x);
