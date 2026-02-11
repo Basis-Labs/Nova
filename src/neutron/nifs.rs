@@ -18,7 +18,6 @@ use crate::{
   Commitment, CommitmentKey,
 };
 use ff::Field;
-use rand::Rng;
 use rand_core::OsRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -88,11 +87,11 @@ pub struct NIFSCombinedOutput<E: Engine> {
   pub rho: E::Scalar,
   /// r_b (folding challenge)
   pub r_b: E::Scalar,
-  /// Fresh NSC instance before folding
+  /// NSC instance before folding
   pub nsc: (FoldedInstance<E>, FoldedWitness<E>),
-  /// (Az, Bz, Cz) for fresh R1CS
+  /// (Az, Bz, Cz) for R1CS
   pub abc: (Vec<E::Scalar>, Vec<E::Scalar>, Vec<E::Scalar>),
-  /// Fresh NSC_PC before folding
+  /// NSC_PC before folding
   pub nsc_pc: (FoldedPowerCheckInstance<E>, FoldedPowerCheckWitness<E>),
 }
 
@@ -212,12 +211,13 @@ pub fn setup_nsc<E: Engine>(
 
 /// Initialize NSC_PC relation with zero/default instances
 ///
-/// Returns (instance, witness) with pc_sumcheck_claim=0, tau=0, and zero weight tables.
+/// Returns (instance, witness) with pc_sumcheck_claim=0, tau=0, and properly committed witness tables.
 pub fn setup_nsc_pc<E: Engine>(
+  ck: &CommitmentKey<E>,
   S_pc: &PowerCheckStructure,
 ) -> (FoldedPowerCheckInstance<E>, FoldedPowerCheckWitness<E>) {
-  let instance = FoldedPowerCheckInstance::default(S_pc);
   let witness = FoldedPowerCheckWitness::default(S_pc);
+  let instance = FoldedPowerCheckInstance::from_witness(ck, &witness);
   (instance, witness)
 }
 
@@ -226,6 +226,7 @@ pub fn setup_nsc_pc<E: Engine>(
 /// With tau=0, the power table is [1, 0, 0, ...] ∥ [1, 0, 0, ...]
 /// which satisfies all PowerCheck constraints since e[i] = e[i-1]·τ = e[i-1]·0 = 0.
 pub fn setup_zc_pc<E: Engine>(
+  ck: &CommitmentKey<E>,
   S_pc: &PowerCheckStructure,
 ) -> (PowerCheckInstance<E>, PowerCheckWitness<E>) {
   let left = S_pc.left;
@@ -237,9 +238,10 @@ pub fn setup_zc_pc<E: Engine>(
   powers_vec[left] = E::Scalar::ONE; // e₂[0] = 1 (base case)
 
   let powers = WeightTable::new(powers_vec, E::Scalar::ZERO, left);
+  let comm_powers = powers.commit(ck);
 
   let instance = PowerCheckInstance {
-    comm_powers: Commitment::<E>::default(),
+    comm_powers,
     tau: E::Scalar::ZERO,
   };
   let witness = PowerCheckWitness { powers };
@@ -344,7 +346,8 @@ impl<E: Engine> NIFS<E> {
 
     // compute the sum-check polynomial's evaluations at r_b
     let eq_rho_r_b = (E::Scalar::ONE - rho) * (E::Scalar::ONE - r_b) + rho * r_b;
-    let eq_rho_r_b_inv = eq_rho_r_b.invert().ok_or(NovaError::DivideByZero)?;
+    let eq_rho_r_b_inv: E::Scalar =
+      Option::from(eq_rho_r_b.invert()).ok_or(NovaError::DivideByZero)?;
     let T_out = poly.evaluate(&r_b) * eq_rho_r_b_inv;
 
     let U = U1.fold(U2, &comm_E, &r_b, &T_out)?;
@@ -400,7 +403,8 @@ impl<E: Engine> NIFS<E> {
 
     // compute the sum-check polynomial's evaluations at r_b
     let eq_rho_r_b = (E::Scalar::ONE - rho) * (E::Scalar::ONE - r_b) + rho * r_b;
-    let eq_rho_r_b_inv = eq_rho_r_b.invert().ok_or(NovaError::DivideByZero)?;
+    let eq_rho_r_b_inv: E::Scalar =
+      Option::from(eq_rho_r_b.invert()).ok_or(NovaError::DivideByZero)?;
     let T_out = self.poly.evaluate(&r_b) * eq_rho_r_b_inv;
 
     let U = U1.fold(U2, &self.comm_E, &r_b, &T_out)?;
@@ -434,6 +438,12 @@ impl<E: Engine> NIFS<E> {
     let mut ro = E::RO2::new(ro_consts.clone());
     ro.absorb(*pp_digest);
 
+    // Absorb running NSC instance
+    nsc_running.0.absorb_in_ro2(&mut ro);
+
+    // Absorb running NSC_PC instance
+    nsc_pc_running.0.absorb_in_ro2(&mut ro);
+
     // Absorb fresh R1CS instance
     r1cs_fresh.0.absorb_in_ro2(&mut ro);
 
@@ -454,8 +464,10 @@ impl<E: Engine> NIFS<E> {
     let E_pc_vec = PowPolynomial::new(&tau, ell_pc).split_evals(S_pc.left_pc, S_pc.right_pc);
     let r_E_pc = E::Scalar::random(&mut OsRng);
     let E_pc = WeightTable::new(E_pc_vec, r_E_pc, S_pc.left_pc);
+    let comm_E_pc: Commitment<E> = E_pc.commit(ck);
 
     comm_E.absorb_in_ro2(&mut ro);
+    comm_E_pc.absorb_in_ro2(&mut ro);
 
     // === PHASE 3: Squeeze ρ (RLC challenge) ===
     let rho = ro.squeeze(NUM_CHALLENGE_BITS, false);
@@ -488,7 +500,6 @@ impl<E: Engine> NIFS<E> {
     // === PHASE 7: Convert ZC_PC to NSC_PC form ===
     // Note: The fresh ZC_PC's power table becomes the witness,
     // and E_pc (with dimensions left_pc, right_pc) becomes the weights
-    let comm_E_pc = E_pc.commit(ck);
     let nsc_pc_fresh_instance = FoldedPowerCheckInstance {
       pc_sumcheck_claim: E::Scalar::ZERO, // Fresh has zero error
       comm_witness: zc_pc_fresh.0.comm_powers,
@@ -546,7 +557,8 @@ impl<E: Engine> NIFS<E> {
 
     // === PHASE 11: Compute T_out values ===
     let eq_rho_r_b = (E::Scalar::ONE - rho) * (E::Scalar::ONE - r_b) + rho * r_b;
-    let eq_rho_r_b_inv = eq_rho_r_b.invert().ok_or(NovaError::DivideByZero)?;
+    let eq_rho_r_b_inv: E::Scalar =
+      Option::from(eq_rho_r_b.invert()).ok_or(NovaError::DivideByZero)?;
 
     let T_out_nsc = poly_nsc.evaluate(&r_b) * eq_rho_r_b_inv;
     let T_out_nsc_pc = poly_pc.evaluate(&r_b) * eq_rho_r_b_inv;
@@ -578,7 +590,7 @@ impl<E: Engine> NIFS<E> {
         poly: poly_nsc,
       },
       nifs_pc: NIFSPowerCheck {
-        comm_E_pc: comm_E,
+        comm_E_pc: comm_E_pc,
         poly_pc,
       },
       folded,
@@ -841,6 +853,34 @@ mod tests {
     Ok(())
   }
 
+  /// Verify commitment homomorphism for NSC_PC (PowerCheck)
+  fn verify_nsc_pc_commitment_homomorphism<E: Engine>(
+    running: &FoldedPowerCheckInstance<E>,
+    fresh: &FoldedPowerCheckInstance<E>,
+    folded: &FoldedPowerCheckInstance<E>,
+    r_b: &E::Scalar,
+  ) -> Result<(), NovaError> {
+    let one_minus_r = E::Scalar::ONE - r_b;
+
+    // Check comm_witness homomorphism
+    let expected_comm_witness = running.comm_witness * one_minus_r + fresh.comm_witness * *r_b;
+    if folded.comm_witness != expected_comm_witness {
+      return Err(NovaError::UnSat {
+        reason: "PC comm_witness homomorphism violated".to_string(),
+      });
+    }
+
+    // Check comm_weights homomorphism
+    let expected_comm_weights = running.comm_weights * one_minus_r + fresh.comm_weights * *r_b;
+    if folded.comm_weights != expected_comm_weights {
+      return Err(NovaError::UnSat {
+        reason: "PC comm_weights homomorphism violated".to_string(),
+      });
+    }
+
+    Ok(())
+  }
+
   /// Verify sumcheck polynomial identity: poly(0) + poly(1) == T_claim
   fn verify_sumcheck_identity<E: Engine>(
     poly: &UniPoly<E::Scalar>,
@@ -1044,8 +1084,8 @@ mod tests {
 
     // Initialize with zeros
     let (nsc_instance, nsc_witness, abc) = setup_nsc::<E>(&str);
-    let (nsc_pc_instance, nsc_pc_witness) = setup_nsc_pc::<E>(&S_pc);
-    let (zc_pc_instance, zc_pc_witness) = setup_zc_pc::<E>(&S_pc);
+    let (nsc_pc_instance, nsc_pc_witness) = setup_nsc_pc::<E>(&ck, &S_pc);
+    let (zc_pc_instance, zc_pc_witness) = setup_zc_pc::<E>(&ck, &S_pc);
 
     // Verify initial ZC_PC is valid
     verify_zc_pc_valid::<E>(&S_pc, &zc_pc_instance, &zc_pc_witness)
@@ -1156,8 +1196,8 @@ mod tests {
 
     // Initialize with zeros
     let (mut nsc_instance, mut nsc_witness, mut abc) = setup_nsc::<E>(&str);
-    let (mut nsc_pc_instance, mut nsc_pc_witness) = setup_nsc_pc::<E>(&S_pc);
-    let (mut zc_pc_instance, mut zc_pc_witness) = setup_zc_pc::<E>(&S_pc);
+    let (mut nsc_pc_instance, mut nsc_pc_witness) = setup_nsc_pc::<E>(&ck, &S_pc);
+    let (mut zc_pc_instance, mut zc_pc_witness) = setup_zc_pc::<E>(&ck, &S_pc);
 
     // Generate two different witnesses
     let (u1, w1) = generate_satisfying_witness::<E>(&shape, &ck, 2, num_cons);
@@ -1214,6 +1254,13 @@ mod tests {
       &result1.r_b,
     )
     .expect("Fold 1: NSC_PC linear folding should be correct");
+    verify_nsc_pc_commitment_homomorphism::<E>(
+      &nsc_pc_instance,
+      &result1.nsc_pc.0,
+      &result1.folded.pc_instance,
+      &result1.r_b,
+    )
+    .expect("Fold 1: NSC_PC commitment homomorphism should hold");
 
     // Update running state
     nsc_instance = result1.folded.nsc_instance.clone();
@@ -1257,8 +1304,13 @@ mod tests {
       &result2.folded.nsc_witness,
     )
     .expect("Fold 2: NSC claim should match");
-    // Note: NSC_PC brute force check only works when pc_sumcheck_claim = 0 (initial fold)
-    // After accumulation, pc_sumcheck_claim != 0 and the relationship involves eq(ρ, r_b)
+    // NSC_PC brute force check - works for ANY pc_sumcheck_claim value
+    verify_nsc_pc_claim_bruteforce::<E>(
+      &S_pc,
+      &result2.folded.pc_instance,
+      &result2.folded.pc_witness,
+    )
+    .expect("Fold 2: NSC_PC claim should match");
     verify_zc_pc_valid::<E>(&S_pc, &result2.new_zc_pc.0, &result2.new_zc_pc.1)
       .expect("Fold 2: New ZC_PC should be valid");
     verify_nsc_linear_folding::<E>(
@@ -1275,6 +1327,13 @@ mod tests {
       &result2.r_b,
     )
     .expect("Fold 2: NSC_PC linear folding should be correct");
+    verify_nsc_pc_commitment_homomorphism::<E>(
+      &nsc_pc_instance,
+      &result2.nsc_pc.0,
+      &result2.folded.pc_instance,
+      &result2.r_b,
+    )
+    .expect("Fold 2: NSC_PC commitment homomorphism should hold");
 
     // Verify sumcheck accumulation
     let T_nsc_claim = (E::Scalar::ONE - result2.rho) * nsc_instance.T;
@@ -1300,8 +1359,8 @@ mod tests {
 
     // Initialize with zeros
     let (mut nsc_instance, mut nsc_witness, mut abc) = setup_nsc::<E>(&str);
-    let (mut nsc_pc_instance, mut nsc_pc_witness) = setup_nsc_pc::<E>(&S_pc);
-    let (mut zc_pc_instance, mut zc_pc_witness) = setup_zc_pc::<E>(&S_pc);
+    let (mut nsc_pc_instance, mut nsc_pc_witness) = setup_nsc_pc::<E>(&ck, &S_pc);
+    let (mut zc_pc_instance, mut zc_pc_witness) = setup_zc_pc::<E>(&ck, &S_pc);
 
     // Generate three different witnesses
     let witnesses: Vec<_> = (2..5)
@@ -1333,15 +1392,13 @@ mod tests {
         &result.folded.nsc_witness,
       )
       .unwrap_or_else(|e| panic!("Step {}: NSC claim failed: {:?}", step, e));
-      // NSC_PC brute force check only works on step 0 when both instances have pc_sumcheck_claim = 0
-      if step == 0 {
-        verify_nsc_pc_claim_bruteforce::<E>(
-          &S_pc,
-          &result.folded.pc_instance,
-          &result.folded.pc_witness,
-        )
-        .unwrap_or_else(|e| panic!("Step {}: NSC_PC claim failed: {:?}", step, e));
-      }
+      // NSC_PC brute force check - works for ANY pc_sumcheck_claim value
+      verify_nsc_pc_claim_bruteforce::<E>(
+        &S_pc,
+        &result.folded.pc_instance,
+        &result.folded.pc_witness,
+      )
+      .unwrap_or_else(|e| panic!("Step {}: NSC_PC claim failed: {:?}", step, e));
       verify_zc_pc_valid::<E>(&S_pc, &result.new_zc_pc.0, &result.new_zc_pc.1)
         .unwrap_or_else(|e| panic!("Step {}: ZC_PC validity failed: {:?}", step, e));
       verify_nsc_linear_folding::<E>(
@@ -1358,6 +1415,13 @@ mod tests {
         &result.r_b,
       )
       .unwrap_or_else(|e| panic!("Step {}: NSC_PC linear folding failed: {:?}", step, e));
+      verify_nsc_pc_commitment_homomorphism::<E>(
+        &nsc_pc_instance,
+        &result.nsc_pc.0,
+        &result.folded.pc_instance,
+        &result.r_b,
+      )
+      .unwrap_or_else(|e| panic!("Step {}: NSC_PC commitment homomorphism failed: {:?}", step, e));
 
       // Update running state
       nsc_instance = result.folded.nsc_instance;

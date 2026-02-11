@@ -127,6 +127,26 @@ pub fn apply_rho_scaling<F: PrimeField>(acc: EvalAcc<F>, rho: &F) -> EvalAcc<F> 
 ///
 /// The R1CS relation is: e · (Az · Bz - Cz) = 0 for all constraints.
 /// This function computes the bound polynomial evaluations needed for sumcheck.
+///
+/// # Tensor-Product Structure and Linear Interpolation
+///
+/// The equality-indicator `e` has tensor structure: `e[i,j] = f[i] × e_left[j]`
+/// where `f = e[left..]` (outer/row factor) and `e_left = e[..left]` (inner/column factor).
+///
+/// When folding two instances, each factor interpolates linearly in `t`:
+/// - `e_left(t) = e1_left + t·(e2_left - e1_left)`
+/// - `f(t) = f1 + t·(f2 - f1)`
+///
+/// The product `e_left(t) × f(t)` is **quadratic** in t, so pre-multiplying at
+/// endpoints and linearly interpolating would be **incorrect**.
+///
+/// ## Nested Loop Solution
+///
+/// To correctly evaluate at points {0, 2, 3, 4, 5}:
+/// - **Inner loop**: interpolates `e_left[j]` linearly, accumulates `Σⱼ e_left(t)[j] × contrib[j]`
+/// - **Outer loop**: multiplies by `f(t)[i]` interpolated at the same point
+///
+/// This correctly computes `e_left(t) × f(t) × contrib` at each evaluation point.
 #[inline]
 pub fn prove_helper<E: Engine>(
   rho: &E::Scalar,
@@ -153,46 +173,52 @@ pub fn prove_helper<E: Engine>(
   let f1 = &e1[left..];
   let f2 = &e2[left..];
 
+  // ==========================================================================
+  // Nested loop for correct tensor-product interpolation
+  // ==========================================================================
   let acc = (0..right)
     .into_par_iter()
     .fold(zero_acc, |outer_acc, i| {
-      // Inner loop accumulates contributions for fixed i
+      // ========================================
+      // Inner loop: linearly interpolate e_left[j] at points {0, 2, 3, 4, 5}
+      // Computes: inner_acc[pt] = Σⱼ comb(e_left(pt)[j], Az(pt), Bz(pt), Cz(pt))
+      // ========================================
       let inner_acc = (0..left).fold(zero_acc(), |acc, j| {
         let k = i * left + j;
         accum_contribution(
           acc,
           comb_r1cs,
-          e1[j],
+          e1[j],   // e_left at t=0
           Az1[k],
           Bz1[k],
           Cz1[k],
-          e2[j],
+          e2[j],   // e_left at t=1
           Az2[k],
           Bz2[k],
           Cz2[k],
         )
       });
 
-      // Scale by the outer f (second half of e) for this row
+      // ========================================
+      // Outer factor: linearly interpolate f[i] at points {0, 2, 3, 4, 5}
+      // Then multiply: eval[pt] = f(pt)[i] × inner_acc[pt]
+      // This correctly produces e_left(t) × f(t) at each point.
+      // ========================================
       let delta_f = f2[i] - f1[i];
 
-      // eval 0: f1[i] * inner_acc.0
-      let e0 = f1[i] * inner_acc.0;
+      // f(t) = f1 + t·delta_f
+      let e0 = f1[i] * inner_acc.0;                     // t=0: f(0) = f1
 
-      // eval 2: (f1 + 2*delta) * inner_acc.1
-      let f_bound = f1[i] + delta_f + delta_f;
+      let f_bound = f1[i] + delta_f + delta_f;          // t=2: f(2) = f1 + 2·delta
       let e2 = f_bound * inner_acc.1;
 
-      // eval 3: (f1 + 3*delta) * inner_acc.2
-      let f_bound = f_bound + delta_f;
+      let f_bound = f_bound + delta_f;                  // t=3: f(3) = f1 + 3·delta
       let e3 = f_bound * inner_acc.2;
 
-      // eval 4: (f1 + 4*delta) * inner_acc.3
-      let f_bound = f_bound + delta_f;
+      let f_bound = f_bound + delta_f;                  // t=4: f(4) = f1 + 4·delta
       let e4 = f_bound * inner_acc.3;
 
-      // eval 5: (f1 + 5*delta) * inner_acc.4
-      let f_bound = f_bound + delta_f;
+      let f_bound = f_bound + delta_f;                  // t=5: f(5) = f1 + 5·delta
       let e5 = f_bound * inner_acc.4;
 
       add_acc(outer_acc, (e0, e2, e3, e4, e5))
@@ -204,20 +230,52 @@ pub fn prove_helper<E: Engine>(
 
 /// Computes evaluations for PowerCheck sum-check polynomial at points 0, 2, 3, 4, 5.
 ///
-/// # Performance: Region-Split Loop Structure
+/// # Mathematical Expression
 ///
-/// This function uses region-split loops instead of a single loop with conditionals.
-/// The PowerCheck relation has 6 distinct regions with different (g₁, g₂, g₃) formulas.
+/// This function computes the RLC-combined PowerCheck claim:
 ///
-/// - Region 0: 1 iteration (base case e₁[0] = 1)
-/// - Region 1: `left-1` iterations (first half chain e₁[i] = τ·e₁[i-1]) ← HOT LOOP
-/// - Region 2: 1 iteration (second half base e₂[0] = 1)
-/// - Region 3: 1 iteration (link constraint e₂[1] = τ^left)
-/// - Region 4: 1 iteration (squaring e₂[2] = e₂[1]²)
-/// - Region 5: `right-3` iterations (second half chain e₂[k] = e₂[1]·e₂[k-1]) ← HOT LOOP
+/// ```text
+/// T = (1-ρ)·T₁ + ρ·T₂
 ///
-/// Hot loops (regions 1 and 5) run in parallel via `rayon::join`, and each is
-/// internally parallelized with `into_par_iter().fold().reduce()`.
+/// where T_k = Σᵢ E_pc_left(col(i)) · E_pc_right(row(i)) · (g₁_k[i] - g₂_k[i]·g₃_k[i])
+/// ```
+///
+/// # Tensor Weight Structure (Critical for Correctness)
+///
+/// The E_pc weights have tensor structure: `E_pc[i] = E_pc_right[row] × E_pc_left[col]`
+/// where `row = i / left_pc` and `col = i % left_pc`.
+///
+/// When folding two instances, each tensor factor is linearly interpolated:
+/// - `w_left(t) = w1_left + t·(w2_left - w1_left)` (linear in t)
+/// - `w_right(t) = w1_right + t·(w2_right - w1_right)` (linear in t)
+///
+/// Their product `w_left(t) × w_right(t)` is **quadratic** in t.
+///
+/// This function uses **nested loops** (mirroring `prove_helper` for R1CS) to correctly
+/// handle the tensor structure:
+/// - Inner loop: accumulates with `w_left[col]` factor (linearly interpolated)
+/// - Outer loop: multiplies by `w_right[row]` factor (linearly interpolated)
+///
+/// This produces correct evaluations at all points {0, 2, 3, 4, 5}.
+///
+/// # Selection Pattern for (g₁, g₂, g₃)
+///
+/// | Region | Index | g₁ | g₂ | g₃ |
+/// |--------|-------|-----|-----|-----|
+/// | 0 | i = 0 | e[0] | 1 | 1 |
+/// | 1 | 1 ≤ i < left | e[i] | e[i-1] | **τ** |
+/// | 2 | i = left | e[left] | 1 | 1 |
+/// | 3 | i = left+1 | e[left+1] | e[left-1] | **τ** |
+/// | 4 | i = left+2 | e[left+2] | e[left+1] | e[left+1] |
+/// | 5 | left+3 ≤ i | e[i] | e[left+1] | e[i-1] |
+///
+/// # Why τ₁ and τ₂?
+///
+/// When folding two PowerCheck instances:
+/// - **Running instance** has power table e₁ with scalar τ₁
+/// - **Fresh instance** has power table e₂ with scalar τ₂
+///
+/// Since g₃ = τ in regions 1 and 3, each instance needs its own τ value.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn prove_helper_pc<E: Engine>(
@@ -239,166 +297,125 @@ pub fn prove_helper_pc<E: Engine>(
 
   let left = S_pc.left;
   let right = S_pc.right;
+  let num_cons = S_pc.num_cons; // = left + right
   let left_pc = S_pc.left_pc;
+  let right_pc = S_pc.right_pc;
 
   // Sanity checks
-  debug_assert_eq!(w1_left.len(), S_pc.left_pc);
-  debug_assert_eq!(w1_right.len(), S_pc.right_pc);
-  debug_assert_eq!(w2_left.len(), S_pc.left_pc);
-  debug_assert_eq!(w2_right.len(), S_pc.right_pc);
+  debug_assert_eq!(w1_left.len(), left_pc);
+  debug_assert_eq!(w1_right.len(), right_pc);
+  debug_assert_eq!(w2_left.len(), left_pc);
+  debug_assert_eq!(w2_right.len(), right_pc);
   debug_assert_eq!(e1_1.len(), left);
   debug_assert_eq!(e1_2.len(), right);
   debug_assert_eq!(e2_1.len(), left);
   debug_assert_eq!(e2_2.len(), right);
 
-  // Helper to compute weight at constraint index i
-  // Weight = E_pc_right[row] * E_pc_left[col] where row = i / left_pc, col = i % left_pc
-  let weight_at = |i: usize, w_left: &[E::Scalar], w_right: &[E::Scalar]| -> E::Scalar {
-    let row = i / left_pc;
-    let col = i % left_pc;
-    w_right[row] * w_left[col]
-  };
+  // Helper to get (g1, g2, g3) values for constraint i based on region
+  // e_first = first half of power table (length = left)
+  // e_second = second half of power table (length = right)
+  let get_g_values =
+    |i: usize,
+     e_first: &[E::Scalar],
+     e_second: &[E::Scalar],
+     tau: &E::Scalar|
+     -> (E::Scalar, E::Scalar, E::Scalar) {
+      if i == 0 {
+        // Region 0: base case
+        (e_first[0], E::Scalar::ONE, E::Scalar::ONE)
+      } else if i < left {
+        // Region 1: first half chain
+        (e_first[i], e_first[i - 1], *tau)
+      } else if i == left {
+        // Region 2: second half base
+        (e_second[0], E::Scalar::ONE, E::Scalar::ONE)
+      } else if i == left + 1 && right > 1 {
+        // Region 3: link
+        (e_second[1], e_first[left - 1], *tau)
+      } else if i == left + 2 && right > 2 {
+        // Region 4: squaring
+        (e_second[2], e_second[1], e_second[1])
+      } else {
+        // Region 5: second half chain
+        let k = i - left;
+        (e_second[k], e_second[1], e_second[k - 1])
+      }
+    };
 
-  // =========================================================================
-  // Single-element regions (O(1) - negligible cost, run inline)
-  // =========================================================================
+  // ==========================================================================
+  // Nested loop for correct tensor-product interpolation
+  //
+  // E_pc has tensor structure: E_pc[i] = w_right[row] × w_left[col]
+  // When folding, each factor interpolates linearly:
+  //   w_left(t) = w1_left + t·(w2_left - w1_left)
+  //   w_right(t) = w1_right + t·(w2_right - w1_right)
+  //
+  // Their product w_left(t)×w_right(t) is QUADRATIC in t.
+  // Pre-multiplying at endpoints would miss the cross-term!
+  //
+  // Solution: nested loops (mirrors prove_helper for R1CS)
+  // - Inner loop: interpolate w_left[col] linearly
+  // - Outer loop: multiply by w_right[row] interpolated at the same point
+  // ==========================================================================
 
-  // Region 0: i = 0 (base case: e₁[0] = 1)
-  let acc_0 = {
-    let i = 0;
-    let w1 = weight_at(i, w1_left, w1_right);
-    let w2 = weight_at(i, w2_left, w2_right);
-    accum_contribution(
-      zero_acc(),
-      comb_powercheck,
-      w1,
-      e1_1[0],
-      E::Scalar::ONE,
-      E::Scalar::ONE,
-      w2,
-      e2_1[0],
-      E::Scalar::ONE,
-      E::Scalar::ONE,
-    )
-  };
+  let acc = (0..right_pc)
+    .into_par_iter()
+    .fold(zero_acc, |outer_acc, row| {
+      // ========================================
+      // Inner loop: linearly interpolate w_left[col] at points {0, 2, 3, 4, 5}
+      // Computes: inner_acc[pt] = Σⱼ comb(w_left(pt)[col], g1(pt), g2(pt), g3(pt))
+      // ========================================
+      let inner_acc = (0..left_pc).fold(zero_acc(), |acc, col| {
+        let i = row * left_pc + col;
+        if i >= num_cons {
+          return acc; // Skip padding
+        }
 
-  // Region 2: i = left (second half base: e₂[0] = 1)
-  let acc_2 = {
-    let i = left;
-    let w1 = weight_at(i, w1_left, w1_right);
-    let w2 = weight_at(i, w2_left, w2_right);
-    accum_contribution(
-      zero_acc(),
-      comb_powercheck,
-      w1,
-      e1_2[0],
-      E::Scalar::ONE,
-      E::Scalar::ONE,
-      w2,
-      e2_2[0],
-      E::Scalar::ONE,
-      E::Scalar::ONE,
-    )
-  };
+        let (g1_1, g2_1, g3_1) = get_g_values(i, e1_1, e1_2, tau_1);
+        let (g1_2, g2_2, g3_2) = get_g_values(i, e2_1, e2_2, tau_2);
 
-  // Region 3: i = left+1 (link constraint: e₂[1] = τ^left = τ·e₁[left-1])
-  let acc_3 = if right > 1 {
-    let i = left + 1;
-    let w1 = weight_at(i, w1_left, w1_right);
-    let w2 = weight_at(i, w2_left, w2_right);
-    accum_contribution(
-      zero_acc(),
-      comb_powercheck,
-      w1,
-      e1_2[1],
-      e1_1[left - 1],
-      *tau_1,
-      w2,
-      e2_2[1],
-      e2_1[left - 1],
-      *tau_2,
-    )
-  } else {
-    zero_acc()
-  };
+        // Pass w_left[col] only (NOT w_left × w_right!)
+        // w_right is applied in the outer loop
+        accum_contribution(
+          acc,
+          comb_powercheck,
+          w1_left[col], // w_left at t=0
+          g1_1,
+          g2_1,
+          g3_1,
+          w2_left[col], // w_left at t=1
+          g1_2,
+          g2_2,
+          g3_2,
+        )
+      });
 
-  // Region 4: i = left+2 (squaring: e₂[2] = e₂[1]²)
-  let acc_4 = if right > 2 {
-    let i = left + 2;
-    let w1 = weight_at(i, w1_left, w1_right);
-    let w2 = weight_at(i, w2_left, w2_right);
-    accum_contribution(
-      zero_acc(),
-      comb_powercheck,
-      w1,
-      e1_2[2],
-      e1_2[1],
-      e1_2[1],
-      w2,
-      e2_2[2],
-      e2_2[1],
-      e2_2[1],
-    )
-  } else {
-    zero_acc()
-  };
+      // ========================================
+      // Outer factor: linearly interpolate w_right[row] at points {0, 2, 3, 4, 5}
+      // Then multiply: eval[pt] = w_right(pt)[row] × inner_acc[pt]
+      // This correctly produces w_left(t) × w_right(t) at each point.
+      // ========================================
+      let delta_w = w2_right[row] - w1_right[row];
 
-  // =========================================================================
-  // HOT LOOPS: Run regions 1 & 5 in parallel via rayon::join
-  // =========================================================================
-  let (acc_1, acc_5) = rayon::join(
-    // Region 1: 1 ≤ i < left (first half chain: e₁[i] = τ·e₁[i-1])
-    || {
-      (1..left)
-        .into_par_iter()
-        .fold(zero_acc, |acc, i| {
-          let w1 = weight_at(i, w1_left, w1_right);
-          let w2 = weight_at(i, w2_left, w2_right);
-          accum_contribution(
-            acc,
-            comb_powercheck,
-            w1,
-            e1_1[i],
-            e1_1[i - 1],
-            *tau_1,
-            w2,
-            e2_1[i],
-            e2_1[i - 1],
-            *tau_2,
-          )
-        })
-        .reduce(zero_acc, add_acc)
-    },
-    // Region 5: 3 ≤ k < right (second half chain: e₂[k] = e₂[1]·e₂[k-1])
-    || {
-      (3..right)
-        .into_par_iter()
-        .fold(zero_acc, |acc, k| {
-          let i = left + k;
-          let w1 = weight_at(i, w1_left, w1_right);
-          let w2 = weight_at(i, w2_left, w2_right);
-          accum_contribution(
-            acc,
-            comb_powercheck,
-            w1,
-            e1_2[k],
-            e1_2[1],
-            e1_2[k - 1],
-            w2,
-            e2_2[k],
-            e2_2[1],
-            e2_2[k - 1],
-          )
-        })
-        .reduce(zero_acc, add_acc)
-    },
-  );
+      // w_right(t) = w1_right + t·delta_w
+      let w0 = w1_right[row];                           // t=0: w_right(0) = w1_right
+      let e0 = w0 * inner_acc.0;
 
-  // Reduce all regions
-  let acc = [acc_0, acc_1, acc_2, acc_3, acc_4, acc_5]
-    .into_iter()
-    .reduce(add_acc)
-    .unwrap();
+      let w2 = w1_right[row] + delta_w + delta_w;       // t=2: w_right(2) = w1_right + 2·delta
+      let e2 = w2 * inner_acc.1;
+
+      let w3 = w2 + delta_w;                            // t=3: w_right(3) = w1_right + 3·delta
+      let e3 = w3 * inner_acc.2;
+
+      let w4 = w3 + delta_w;                            // t=4: w_right(4) = w1_right + 4·delta
+      let e4 = w4 * inner_acc.3;
+
+      let w5 = w4 + delta_w;                            // t=5: w_right(5) = w1_right + 5·delta
+      let e5 = w5 * inner_acc.4;
+
+      add_acc(outer_acc, (e0, e2, e3, e4, e5))
+    })
+    .reduce(zero_acc, add_acc);
 
   apply_rho_scaling(acc, rho)
 }
@@ -639,6 +656,229 @@ mod tests {
       T_claim_expected,
       "Sumcheck claim must equal RLC of individual claims: (1-ρ)·T_1 + ρ·T_2"
     );
+  }
+
+  /// Brute-force compute PowerCheck contribution at arbitrary interpolation point t.
+  ///
+  /// This interpolates ALL inputs (weights, witness, τ) at point t and computes:
+  /// Σᵢ w_left(t)[col] × w_right(t)[row] × (g1(t)[i] - g2(t)[i]·g3(t)[i])
+  ///
+  /// This is the RAW contribution BEFORE ρ-scaling.
+  fn compute_pc_at_point_raw<F: Field>(
+    t: &F,
+    w1_left: &[F],
+    w1_right: &[F],
+    w2_left: &[F],
+    w2_right: &[F],
+    e1_1: &[F],
+    e1_2: &[F], // Running: first and second halves
+    e2_1: &[F],
+    e2_2: &[F], // Fresh: first and second halves
+    tau_1: &F,
+    tau_2: &F,
+    left: usize,
+    left_pc: usize,
+    num_cons: usize,
+  ) -> F {
+    // Linear interpolation helper: a + t·(b - a)
+    let interp = |a: &F, b: &F| -> F { *a + *t * (*b - *a) };
+
+    // Interpolate all weights at t
+    let w_left: Vec<F> = w1_left
+      .iter()
+      .zip(w2_left)
+      .map(|(a, b)| interp(a, b))
+      .collect();
+    let w_right: Vec<F> = w1_right
+      .iter()
+      .zip(w2_right)
+      .map(|(a, b)| interp(a, b))
+      .collect();
+
+    // Interpolate witness (power table) at t
+    let e_first: Vec<F> = e1_1.iter().zip(e2_1).map(|(a, b)| interp(a, b)).collect();
+    let e_second: Vec<F> = e1_2.iter().zip(e2_2).map(|(a, b)| interp(a, b)).collect();
+
+    // Interpolate τ at t
+    let tau = interp(tau_1, tau_2);
+
+    // Sum over all constraints
+    (0..num_cons)
+      .map(|i| {
+        // Compute (g1, g2, g3) based on region (same as in prove_helper_pc)
+        let (g1, g2, g3) = if i == 0 {
+          (e_first[0], F::ONE, F::ONE)
+        } else if i < left {
+          (e_first[i], e_first[i - 1], tau)
+        } else if i == left {
+          (e_second[0], F::ONE, F::ONE)
+        } else if i == left + 1 && e_second.len() > 1 {
+          (e_second[1], e_first[left - 1], tau)
+        } else if i == left + 2 && e_second.len() > 2 {
+          (e_second[2], e_second[1], e_second[1])
+        } else {
+          let k = i - left;
+          (e_second[k], e_second[1], e_second[k - 1])
+        };
+
+        let residual = g1 - g2 * g3;
+
+        // Weight from tensor product
+        let row = i / left_pc;
+        let col = i % left_pc;
+        w_left[col] * w_right[row] * residual
+      })
+      .fold(F::ZERO, |acc, x| acc + x)
+  }
+
+  /// Test that prove_helper_pc evaluations at {0, 2, 3, 4, 5} match brute-force.
+  ///
+  /// This is the CRITICAL test that verifies tensor-product interpolation is correct.
+  #[test]
+  fn test_prove_helper_pc_evaluations_at_all_points() {
+    type E = PallasEngine;
+    type F = <E as Engine>::Scalar;
+
+    let left = 4usize;
+    let right = 4usize;
+    let S_pc = PowerCheckStructure::new(left, right);
+
+    // Use DIFFERENT τ values to ensure cross-terms matter
+    let tau_1 = F::from(7u64);
+    let tau_2 = F::from(13u64);
+
+    // Running instance: CORRUPTED table (non-zero residuals) to make the test meaningful
+    let (mut e1_1, e2_1) = create_valid_power_table(&tau_1, left, right);
+    e1_1[2] = F::from(999u64); // Corrupt
+
+    // Fresh instance: valid table
+    let (e1_2, e2_2) = create_valid_power_table(&tau_2, left, right);
+
+    // E_pc weights - use varied values to ensure tensor structure matters
+    let w1_left: Vec<F> = (0..S_pc.left_pc).map(|i| F::from((i * 3 + 1) as u64)).collect();
+    let w1_right: Vec<F> = (0..S_pc.right_pc).map(|i| F::from((i * 5 + 2) as u64)).collect();
+    let w2_left: Vec<F> = (0..S_pc.left_pc).map(|i| F::from((i * 7 + 3) as u64)).collect();
+    let w2_right: Vec<F> = (0..S_pc.right_pc).map(|i| F::from((i * 11 + 4) as u64)).collect();
+
+    let rho = F::from(42u64);
+
+    // Get evaluations from prove_helper_pc (these are ρ-scaled)
+    let (e0, e2, e3, e4, e5) = prove_helper_pc::<E>(
+      &rho,
+      &S_pc,
+      (&w1_left, &w1_right),
+      (&w2_left, &w2_right),
+      (&e1_1, &e2_1),
+      (&e1_2, &e2_2),
+      &tau_1,
+      &tau_2,
+    );
+
+    // Compute ρ-scaling factors (from apply_rho_scaling)
+    let scale_0 = F::ONE - rho; // (1 - ρ)
+    let scale_2 = F::from(3u64) * rho - F::ONE; // (3ρ - 1)
+    let scale_3 = F::from(5u64) * rho - F::from(2u64); // (5ρ - 2)
+    let scale_4 = F::from(7u64) * rho - F::from(3u64); // (7ρ - 3)
+    let scale_5 = F::from(9u64) * rho - F::from(4u64); // (9ρ - 4)
+
+    // Compute expected values at each point using brute-force
+    let raw_0 = compute_pc_at_point_raw(
+      &F::ZERO,
+      &w1_left,
+      &w1_right,
+      &w2_left,
+      &w2_right,
+      &e1_1,
+      &e2_1,
+      &e1_2,
+      &e2_2,
+      &tau_1,
+      &tau_2,
+      left,
+      S_pc.left_pc,
+      S_pc.num_cons,
+    );
+
+    let raw_2 = compute_pc_at_point_raw(
+      &F::from(2u64),
+      &w1_left,
+      &w1_right,
+      &w2_left,
+      &w2_right,
+      &e1_1,
+      &e2_1,
+      &e1_2,
+      &e2_2,
+      &tau_1,
+      &tau_2,
+      left,
+      S_pc.left_pc,
+      S_pc.num_cons,
+    );
+
+    let raw_3 = compute_pc_at_point_raw(
+      &F::from(3u64),
+      &w1_left,
+      &w1_right,
+      &w2_left,
+      &w2_right,
+      &e1_1,
+      &e2_1,
+      &e1_2,
+      &e2_2,
+      &tau_1,
+      &tau_2,
+      left,
+      S_pc.left_pc,
+      S_pc.num_cons,
+    );
+
+    let raw_4 = compute_pc_at_point_raw(
+      &F::from(4u64),
+      &w1_left,
+      &w1_right,
+      &w2_left,
+      &w2_right,
+      &e1_1,
+      &e2_1,
+      &e1_2,
+      &e2_2,
+      &tau_1,
+      &tau_2,
+      left,
+      S_pc.left_pc,
+      S_pc.num_cons,
+    );
+
+    let raw_5 = compute_pc_at_point_raw(
+      &F::from(5u64),
+      &w1_left,
+      &w1_right,
+      &w2_left,
+      &w2_right,
+      &e1_1,
+      &e2_1,
+      &e1_2,
+      &e2_2,
+      &tau_1,
+      &tau_2,
+      left,
+      S_pc.left_pc,
+      S_pc.num_cons,
+    );
+
+    // Compare ρ-scaled values
+    let expected_0 = scale_0 * raw_0;
+    let expected_2 = scale_2 * raw_2;
+    let expected_3 = scale_3 * raw_3;
+    let expected_4 = scale_4 * raw_4;
+    let expected_5 = scale_5 * raw_5;
+
+    assert_eq!(e0, expected_0, "Evaluation at t=0 should match brute-force");
+    assert_eq!(e2, expected_2, "Evaluation at t=2 should match brute-force");
+    assert_eq!(e3, expected_3, "Evaluation at t=3 should match brute-force");
+    assert_eq!(e4, expected_4, "Evaluation at t=4 should match brute-force");
+    assert_eq!(e5, expected_5, "Evaluation at t=5 should match brute-force");
   }
 
   /// Test that valid power tables have all constraints = 0

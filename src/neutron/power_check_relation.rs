@@ -1,9 +1,8 @@
 //! This module defines relations used in the PowerCheck folding scheme
 use crate::{
   neutron::{relation::Structure, weight_table::WeightTable},
-  spartan::math::Math,
   traits::{AbsorbInRO2Trait, Engine, ROTrait},
-  Commitment,
+  Commitment, CommitmentKey,
 };
 use ff::Field;
 use serde::{Deserialize, Serialize};
@@ -34,8 +33,17 @@ impl PowerCheckStructure {
   /// Create a new PowerCheckStructure from split dimensions
   pub fn new(left: usize, right: usize) -> Self {
     let num_cons = left + right;
-    let num_cons_padded = num_cons.next_power_of_two();
-    let ell_pc = num_cons_padded.log_2();
+
+    // Assert domain size is power of two (paper's intended setting with ℓ even)
+    assert!(
+      num_cons.is_power_of_two(),
+      "PC domain size must be power of two; got {} (left={}, right={})",
+      num_cons,
+      left,
+      right
+    );
+
+    let ell_pc = num_cons.trailing_zeros() as usize;
     let left_pc = 1 << ell_pc.div_ceil(2);
     let right_pc = 1 << (ell_pc / 2);
 
@@ -104,7 +112,20 @@ pub struct FoldedPowerCheckWitness<E: Engine> {
 }
 
 impl<E: Engine> FoldedPowerCheckInstance<E> {
-  /// Create a default instance
+  /// Create an instance from a witness with proper commitments
+  pub fn from_witness(
+    ck: &CommitmentKey<E>,
+    w: &FoldedPowerCheckWitness<E>,
+  ) -> Self {
+    Self {
+      pc_sumcheck_claim: E::Scalar::ZERO,
+      comm_witness: w.witness.commit(ck),
+      comm_weights: w.weights.commit(ck),
+      tau: E::Scalar::ZERO,
+    }
+  }
+
+  /// Create a default instance (zero commitments, only valid if witness is also all zeros with zero randomness)
   pub fn default(S: &PowerCheckStructure) -> Self {
     // Suppress unused warning - S is kept for API consistency
     let _ = S;
@@ -209,6 +230,12 @@ pub fn pc_g_at<F: Field>(
   e2: &[F], // table[left..]
   tau: F,
 ) -> (F, F, F) {
+  debug_assert!(
+    i < left + e2.len(),
+    "PC constraint index {i} out of bounds (num_cons = {})",
+    left + e2.len()
+  );
+
   // g₁ is always e[i]
   let g1 = if i < left { e1[i] } else { e2[i - left] };
 
@@ -242,6 +269,11 @@ pub fn pc_g_at<F: Field>(
 /// For a corrupted table, at least one residual will be non-zero.
 #[inline(always)]
 pub fn pc_residual_at<F: Field>(i: usize, left: usize, e1: &[F], e2: &[F], tau: F) -> F {
+  debug_assert!(
+    i < left + e2.len(),
+    "PC constraint index {i} out of bounds (num_cons = {})",
+    left + e2.len()
+  );
   let (g1, g2, g3) = pc_g_at(i, left, e1, e2, tau);
   g1 - g2 * g3
 }
