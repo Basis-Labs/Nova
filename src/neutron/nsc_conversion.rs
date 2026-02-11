@@ -12,7 +12,7 @@ use crate::{
     weight_table::WeightTable,
   },
   r1cs::{R1CSInstance, R1CSWitness},
-  spartan::polys::power::PowPolynomial,
+  spartan::{math::Math, polys::power::PowPolynomial},
   traits::{AbsorbInRO2Trait, Engine, ROTrait},
   Commitment, CommitmentKey,
 };
@@ -26,8 +26,11 @@ pub struct NSCConversionOutput<E: Engine> {
   /// Challenge τ for power polynomial (used to construct E)
   pub tau: E::Scalar,
 
-  /// Shared weight table [e₁ || e₂] - used by both main NSC and NSC_PC
+  /// Shared weight table [e₁ || e₂] for main NSC - dimensions (left, right)
   pub E: WeightTable<E>,
+
+  /// Weight table for PowerCheck sumcheck - dimensions (left_pc, right_pc)
+  pub E_pc: WeightTable<E>,
 
   /// Commitment to E
   pub comm_E: Commitment<E>,
@@ -60,8 +63,6 @@ pub fn convert_to_nsc<E: Engine>(
   zc_pc: (&PowerCheckInstance<E>, &PowerCheckWitness<E>),
   transcript: &mut E::RO2,
 ) -> Result<NSCConversionOutput<E>, NovaError> {
-  let _ = S_pc; // For API consistency
-
   // Step 1: Absorb fresh R1CS instance into transcript
   let (U2, W2) = zc;
   U2.absorb_in_ro2(transcript);
@@ -73,36 +74,47 @@ pub fn convert_to_nsc<E: Engine>(
   // Step 3: Squeeze τ from transcript
   let tau = transcript.squeeze(NUM_CHALLENGE_BITS, false);
 
-  // Step 4: Create power table E = [e₁ || e₂] from τ
+  // Step 4: Create power table E = [e₁ || e₂] from τ for main NSC
   // e₁ = [1, τ, τ², ..., τ^(left-1)]
   // e₂ = [1, τ^left, τ^(2·left), ...]
   let E_vec = PowPolynomial::new(&tau, S.ell).split_evals(S.left, S.right);
   let r_E = E::Scalar::random(&mut OsRng);
   let E = WeightTable::new(E_vec, r_E, S.left);
 
-  // Step 5: Commit to E
+  // Step 5: Create E_pc for PowerCheck sumcheck with dimensions (left_pc, right_pc)
+  // This uses the same τ but different split dimensions for the PC sumcheck structure
+  let ell_pc = (S_pc.left_pc * S_pc.right_pc).log_2();
+  let E_pc_vec = PowPolynomial::new(&tau, ell_pc).split_evals(S_pc.left_pc, S_pc.right_pc);
+  let r_E_pc = E::Scalar::random(&mut OsRng);
+  let E_pc = WeightTable::new(E_pc_vec, r_E_pc, S_pc.left_pc);
+
+  // Step 6: Commit to E (main NSC table, not E_pc)
   let comm_E: Commitment<E> = E.commit(ck);
 
-  // Step 6: Absorb comm_E into transcript (for downstream challenges)
+  // Step 7: Absorb comm_E into transcript (for downstream challenges)
   comm_E.absorb_in_ro2(transcript);
 
-  // Step 7: Compute (Az, Bz, Cz) for fresh R1CS
+  // Step 8: Compute (Az, Bz, Cz) for fresh R1CS
   let z2 = [W2.W.clone(), vec![E::Scalar::ONE], U2.X.clone()].concat();
   let (Az, Bz, Cz) = S.S.multiply_vec(&z2)?;
 
-  // Step 8: Convert input ZC_PC to NSC_PC form
+  // Step 9: Convert input ZC_PC to NSC_PC form
+  // The NSC_PC uses:
+  //   - witness: the original power table being checked (from pc_wit)
+  //   - weights: E_pc with dimensions (left_pc, right_pc) for sumcheck
   let nsc_pc_instance = FoldedPowerCheckInstance {
     T_pc: E::Scalar::ZERO,
     comm_witness: pc_inst.comm_powers,
-    comm_weights: comm_E,
+    comm_weights: E_pc.commit(ck),
     tau: pc_inst.tau,
   };
   let nsc_pc_witness = FoldedPowerCheckWitness {
     witness: pc_wit.powers.clone(),
-    weights: E.clone(),
+    weights: E_pc.clone(),
   };
 
-  // Step 9: Create fresh PowerCheck instance/witness (the hanging ZC_PC)
+  // Step 10: Create fresh PowerCheck instance/witness (the hanging ZC_PC)
+  // This checks that E is a valid power table
   let fresh_pc_instance = PowerCheckInstance {
     comm_powers: comm_E,
     tau,
@@ -112,6 +124,7 @@ pub fn convert_to_nsc<E: Engine>(
   Ok(NSCConversionOutput {
     tau,
     E,
+    E_pc,
     comm_E,
     Az,
     Bz,

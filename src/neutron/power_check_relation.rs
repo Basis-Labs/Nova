@@ -136,11 +136,27 @@ impl<E: Engine> FoldedPowerCheckInstance<E> {
 }
 
 impl<E: Engine> FoldedPowerCheckWitness<E> {
-  /// Create a default witness
+  /// Create a default witness for tau=0
+  ///
+  /// Note: witness has dimensions (left, right) matching the power table,
+  /// but weights has dimensions (left_pc, right_pc) for the sumcheck structure.
+  ///
+  /// The witness is a valid power table for tau=0: [1, 0, 0, ...] || [1, 0, 0, ...]
+  /// This satisfies all PowerCheck constraints since e[i] = e[i-1]·τ = e[i-1]·0 = 0.
   pub fn default(S: &PowerCheckStructure) -> Self {
+    // witness: power table for tau=0, with e1[0]=1 and e2[0]=1
+    let mut witness_vec = vec![E::Scalar::ZERO; S.left + S.right];
+    witness_vec[0] = E::Scalar::ONE; // e₁[0] = 1 (base case)
+    witness_vec[S.left] = E::Scalar::ONE; // e₂[0] = 1 (base case)
+
     Self {
-      witness: WeightTable::new(vec![E::Scalar::ZERO; S.left + S.right], E::Scalar::ZERO, S.left),
-      weights: WeightTable::new(vec![E::Scalar::ZERO; S.left + S.right], E::Scalar::ZERO, S.left),
+      witness: WeightTable::new(witness_vec, E::Scalar::ZERO, S.left),
+      // weights: sumcheck weights, dimensions (left_pc, right_pc)
+      weights: WeightTable::new(
+        vec![E::Scalar::ZERO; S.left_pc + S.right_pc],
+        E::Scalar::ZERO,
+        S.left_pc,
+      ),
     }
   }
 
