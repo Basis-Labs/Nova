@@ -116,6 +116,32 @@ impl<Scalar: PrimeField + CustomSerdeTrait> UniPoly<Scalar> {
     eval
   }
 
+  /// Returns a new polynomial with all coefficients scaled by `scalar`.
+  /// Note: This is an immutable version that returns a new polynomial.
+  /// See `provider/mercury.rs` for the mutable `scale` method.
+  pub fn scaled(&self, scalar: &Scalar) -> Self {
+    Self {
+      coeffs: self.coeffs.iter().map(|c| *c * scalar).collect(),
+    }
+  }
+
+  /// Returns a new polynomial that is the sum of `self` and `other`.
+  ///
+  /// If the polynomials have different degrees, the result has the degree of the larger.
+  pub fn add(&self, other: &Self) -> Self {
+    let max_len = self.coeffs.len().max(other.coeffs.len());
+    let mut coeffs = vec![Scalar::ZERO; max_len];
+
+    for (i, c) in self.coeffs.iter().enumerate() {
+      coeffs[i] += c;
+    }
+    for (i, c) in other.coeffs.iter().enumerate() {
+      coeffs[i] += c;
+    }
+
+    Self { coeffs }
+  }
+
   /// Compresses the polynomial by omitting the linear term.
   pub fn compress(&self) -> CompressedUniPoly<Scalar> {
     let coeffs_except_linear_term = [&self.coeffs[0..1], &self.coeffs[2..]].concat();

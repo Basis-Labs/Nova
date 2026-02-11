@@ -6,7 +6,13 @@
 //! - `prove_helper` for R1CS sumcheck polynomial evaluation
 //! - `prove_helper_pc` for PowerCheck sumcheck polynomial evaluation
 #![allow(non_snake_case)]
-use crate::{neutron::power_check_relation::PowerCheckStructure, traits::Engine};
+use crate::{
+  constants::NUM_CHALLENGE_BITS,
+  errors::NovaError,
+  neutron::power_check_relation::PowerCheckStructure,
+  spartan::polys::univariate::UniPoly,
+  traits::{evm_serde::CustomSerdeTrait, AbsorbInRO2Trait, Engine, ROTrait},
+};
 use ff::{Field, PrimeField};
 use rayon::prelude::*;
 
@@ -121,6 +127,170 @@ pub fn apply_rho_scaling<F: PrimeField>(acc: EvalAcc<F>, rho: &F) -> EvalAcc<F> 
     acc.3 * seven_rho_minus_three,
     acc.4 * nine_rho_minus_four,
   )
+}
+
+/// Build sumcheck polynomial from evaluations and claim.
+///
+/// The polynomial satisfies: poly(0) + poly(1) = T_claim
+/// This is enforced by setting eval_1 = T_claim - e0.
+///
+/// Input evals are at points (0, 2, 3, 4, 5); eval_1 is derived.
+#[inline]
+pub fn build_sumcheck_poly<F: PrimeField + CustomSerdeTrait>(
+  evals: EvalAcc<F>,
+  T_claim: F,
+) -> UniPoly<F> {
+  let (e0, e2, e3, e4, e5) = evals;
+  let e1 = T_claim - e0;
+  UniPoly::from_evals(&[e0, e1, e2, e3, e4, e5])
+}
+
+/// Compute T_out = poly(r_b) / eq(ρ, r_b)
+///
+/// This extracts the folded claim from the sumcheck polynomial.
+/// Returns error if eq(ρ, r_b) = 0 (division by zero).
+#[inline]
+pub fn compute_T_out<F: PrimeField + CustomSerdeTrait>(
+  poly: &UniPoly<F>,
+  rho: &F,
+  r_b: &F,
+) -> Result<F, NovaError> {
+  let eq_rho_r_b = (F::ONE - rho) * (F::ONE - r_b) + *rho * *r_b;
+  let eq_rho_r_b_inv: F =
+    Option::from(eq_rho_r_b.invert()).ok_or(NovaError::DivideByZero)?;
+  Ok(poly.evaluate(r_b) * eq_rho_r_b_inv)
+}
+
+/// Run a complete sumcheck round: build polynomial and compute T_out.
+///
+/// Combines `build_sumcheck_poly` and `compute_T_out` into a single call.
+/// Returns (polynomial, T_out).
+#[inline]
+pub fn sumcheck_round<F: PrimeField + CustomSerdeTrait>(
+  evals: EvalAcc<F>,
+  T_claim: F,
+  rho: &F,
+  r_b: &F,
+) -> Result<(UniPoly<F>, F), NovaError> {
+  let poly = build_sumcheck_poly(evals, T_claim);
+  let T_out = compute_T_out(&poly, rho, r_b)?;
+  Ok((poly, T_out))
+}
+
+/// Output of combined NSC + NSC_PC sumcheck (Construction 4)
+///
+/// Per NeutronNova paper: The proof consists of a SINGLE combined polynomial
+/// `poly = poly_nsc + γ·poly_pc` where γ is a random challenge.
+#[derive(Clone, Debug)]
+pub struct CombinedSumcheckOutput<E: Engine> {
+  /// Combined polynomial: poly_nsc + γ·poly_pc (the actual proof)
+  pub poly: UniPoly<E::Scalar>,
+  /// γ challenge used for combination
+  pub gamma: E::Scalar,
+  /// Folding challenge r_b
+  pub r_b: E::Scalar,
+  /// Output sumcheck claim for NSC (needed for folding)
+  pub sumcheck_claim_out_nsc: E::Scalar,
+  /// Output sumcheck claim for NSC_PC (needed for folding)
+  pub sumcheck_claim_out_pc: E::Scalar,
+}
+
+/// Run combined NSC + NSC_PC sumcheck (Construction 4 from NeutronNova paper)
+///
+/// This function:
+/// 1. Samples γ challenge for combining NSC and NSC_PC
+/// 2. Computes poly_nsc and poly_pc separately
+/// 3. Combines them: poly = poly_nsc + γ·poly_pc
+/// 4. Absorbs combined poly, squeezes r_b
+/// 5. Computes output claims for folding
+///
+/// The combined polynomial satisfies:
+/// `poly(0) + poly(1) = sumcheck_claim_nsc + γ·sumcheck_claim_pc`
+#[allow(clippy::too_many_arguments)]
+pub fn run_combined_sumfold<E: Engine>(
+  rho: &E::Scalar,
+  // NSC inputs
+  nsc_claim_running: E::Scalar,
+  dims: (usize, usize),
+  e_running: &[E::Scalar],
+  abc_running: (&[E::Scalar], &[E::Scalar], &[E::Scalar]),
+  e_fresh: &[E::Scalar],
+  abc_fresh: (&[E::Scalar], &[E::Scalar], &[E::Scalar]),
+  // NSC_PC inputs
+  nsc_pc_claim_running: E::Scalar,
+  S_pc: &PowerCheckStructure,
+  weights_running: (&[E::Scalar], &[E::Scalar]),
+  weights_fresh: (&[E::Scalar], &[E::Scalar]),
+  witness_running: (&[E::Scalar], &[E::Scalar]),
+  witness_fresh: (&[E::Scalar], &[E::Scalar]),
+  tau_running: &E::Scalar,
+  tau_fresh: &E::Scalar,
+  // Transcript
+  transcript: &mut E::RO2,
+) -> Result<CombinedSumcheckOutput<E>, NovaError> {
+  // Step 1: Sample γ challenge for combining NSC and NSC_PC
+  let gamma = transcript.squeeze(NUM_CHALLENGE_BITS, false);
+
+  // Step 2: Compute sumcheck claims
+  // sumcheck_claim_nsc = (1-ρ)·claim_running + ρ·claim_fresh where claim_fresh = 0
+  let one_minus_rho = E::Scalar::ONE - rho;
+  let sumcheck_claim_nsc = one_minus_rho * nsc_claim_running;
+  // sumcheck_claim_pc = (1-ρ)·claim_running + ρ·claim_fresh where claim_fresh = 0
+  let sumcheck_claim_pc = one_minus_rho * nsc_pc_claim_running;
+
+  // Step 3: Run NSC sumcheck
+  let evals_nsc: EvalAcc<E::Scalar> = prove_helper::<E>(
+    rho,
+    dims,
+    e_running,
+    abc_running.0,
+    abc_running.1,
+    abc_running.2,
+    e_fresh,
+    abc_fresh.0,
+    abc_fresh.1,
+    abc_fresh.2,
+  );
+  let poly_nsc = build_sumcheck_poly(evals_nsc, sumcheck_claim_nsc);
+
+  // Step 4: Run NSC_PC sumcheck
+  let evals_pc: EvalAcc<E::Scalar> = prove_helper_pc::<E>(
+    rho,
+    S_pc,
+    weights_running,
+    weights_fresh,
+    witness_running,
+    witness_fresh,
+    tau_running,
+    tau_fresh,
+  );
+  let poly_pc = build_sumcheck_poly(evals_pc, sumcheck_claim_pc);
+
+  // Step 5: Combine with γ: poly = poly_nsc + γ·poly_pc
+  let poly = {
+    let poly_pc_scaled = poly_pc.scaled(&gamma);
+    poly_nsc.add(&poly_pc_scaled)
+  };
+
+  // Step 6: Absorb combined poly, squeeze r_b
+  <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly, transcript);
+  let r_b = transcript.squeeze(NUM_CHALLENGE_BITS, false);
+
+  // Step 7: Compute output claims
+  let eq_rho_r_b = one_minus_rho * (E::Scalar::ONE - r_b) + *rho * r_b;
+  let eq_rho_r_b_inv: E::Scalar =
+    Option::from(eq_rho_r_b.invert()).ok_or(NovaError::DivideByZero)?;
+
+  let sumcheck_claim_out_nsc = poly_nsc.evaluate(&r_b) * eq_rho_r_b_inv;
+  let sumcheck_claim_out_pc = poly_pc.evaluate(&r_b) * eq_rho_r_b_inv;
+
+  Ok(CombinedSumcheckOutput {
+    poly,
+    gamma,
+    r_b,
+    sumcheck_claim_out_nsc,
+    sumcheck_claim_out_pc,
+  })
 }
 
 /// Computes evaluations of the R1CS sum-check polynomial at 0, 2, 3, 4, 5.

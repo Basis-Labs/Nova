@@ -6,9 +6,9 @@ use crate::{
   neutron::{
     power_check_relation::{
       fresh_power_check, FoldedPowerCheckInstance, FoldedPowerCheckWitness, PowerCheckInstance,
-      PowerCheckStructure, PowerCheckWitness,
+      PowerCheckWitness,
     },
-    relation::Structure,
+    relation::{FoldedInstance, FoldedWitness, Structure},
     weight_table::WeightTable,
   },
   r1cs::{R1CSInstance, R1CSWitness},
@@ -39,6 +39,9 @@ pub struct NSCConversionOutput<E: Engine> {
   /// Matrix-vector product Cz for fresh R1CS
   pub Cz: Vec<E::Scalar>,
 
+  /// Fresh R1CS converted to NSC form
+  pub nsc: (FoldedInstance<E>, FoldedWitness<E>),
+
   /// Input ZC_PC converted to NSC_PC form (attaches E as weights)
   pub nsc_pc: (FoldedPowerCheckInstance<E>, FoldedPowerCheckWitness<E>),
 
@@ -55,7 +58,6 @@ pub struct NSCConversionOutput<E: Engine> {
 pub fn convert_to_nsc<E: Engine>(
   ck: &CommitmentKey<E>,
   S: &Structure<E>,
-  _S_pc: &PowerCheckStructure,
   zc: (&R1CSInstance<E>, &R1CSWitness<E>),
   zc_pc: (&PowerCheckInstance<E>, &PowerCheckWitness<E>),
   transcript: &mut E::RO2,
@@ -93,6 +95,16 @@ pub fn convert_to_nsc<E: Engine>(
   let nsc_pc_instance = FoldedPowerCheckInstance::from_fresh_zc_pc(U_pc, comm_E);
   let nsc_pc_witness = FoldedPowerCheckWitness::from_fresh_zc_pc(W_pc, E.clone());
 
+  // Step 8: Create fresh NSC form from R1CS
+  let nsc_instance = FoldedInstance {
+    comm_W: U2.comm_W,
+    comm_E,
+    T: E::Scalar::ZERO,
+    u: E::Scalar::ONE,
+    X: U2.X.clone(),
+  };
+  let nsc_witness = FoldedWitness::from_r1cs(W2, E.clone());
+
   Ok(NSCConversionOutput {
     tau,
     E,
@@ -100,6 +112,7 @@ pub fn convert_to_nsc<E: Engine>(
     Az,
     Bz,
     Cz,
+    nsc: (nsc_instance, nsc_witness),
     nsc_pc: (nsc_pc_instance, nsc_pc_witness),
     fresh_pc: (fresh_pc_instance, fresh_pc_witness),
   })
