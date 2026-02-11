@@ -79,7 +79,7 @@ pub struct PowerCheckWitness<E: Engine> {
 /// This is the entry point for creating a PowerCheck that verifies E is a valid power table.
 /// The returned instance/witness can then be converted to NSC_PC form via
 /// `FoldedPowerCheckInstance::from_fresh_zc_pc` and `FoldedPowerCheckWitness::from_fresh_zc_pc`.
-pub fn fresh_power_check<E: Engine>(
+pub fn generate_power_check_relation<E: Engine>(
   tau: &E::Scalar,
   left: usize,
   right: usize,
@@ -143,10 +143,7 @@ impl<E: Engine> FoldedPowerCheckInstance<E> {
   }
 
   /// Create an instance from a witness with proper commitments
-  pub fn from_witness(
-    ck: &CommitmentKey<E>,
-    w: &FoldedPowerCheckWitness<E>,
-  ) -> Self {
+  pub fn from_witness(ck: &CommitmentKey<E>, w: &FoldedPowerCheckWitness<E>) -> Self {
     Self {
       pc_sumcheck_claim: E::Scalar::ZERO,
       comm_witness: w.witness.commit(ck),
@@ -167,21 +164,14 @@ impl<E: Engine> FoldedPowerCheckInstance<E> {
     }
   }
 
-  /// Fold the instance with a fresh instance
-  pub fn fold(
-    &self,
-    u2: &PowerCheckInstance<E>,
-    r_b: &E::Scalar,
-    comm_weights_new: &Commitment<E>,
-    pc_sumcheck_claim_out: &E::Scalar,
-  ) -> Self {
+  /// Fold two FoldedPowerCheckInstances together
+  pub fn fold(&self, other: &Self, r_b: &E::Scalar, pc_sumcheck_claim_out: &E::Scalar) -> Self {
     let one_minus_r = E::Scalar::ONE - r_b;
-
     Self {
       pc_sumcheck_claim: *pc_sumcheck_claim_out,
-      comm_witness: self.comm_witness * one_minus_r + u2.comm_powers * *r_b,
-      comm_weights: self.comm_weights * one_minus_r + *comm_weights_new * *r_b,
-      tau: one_minus_r * self.tau + *r_b * u2.tau,
+      comm_witness: self.comm_witness * one_minus_r + other.comm_witness * *r_b,
+      comm_weights: self.comm_weights * one_minus_r + other.comm_weights * *r_b,
+      tau: self.tau + *r_b * (other.tau - self.tau),
     }
   }
 }
@@ -224,11 +214,11 @@ impl<E: Engine> FoldedPowerCheckWitness<E> {
     }
   }
 
-  /// Fold the witness with a fresh witness
-  pub fn fold(&self, w2: &PowerCheckWitness<E>, weights_new: &WeightTable<E>, r_b: &E::Scalar) -> Self {
+  /// Fold two FoldedPowerCheckWitnesses together
+  pub fn fold(&self, other: &Self, r_b: &E::Scalar) -> Self {
     Self {
-      witness: self.witness.fold(&w2.powers, r_b),
-      weights: self.weights.fold(weights_new, r_b),
+      witness: self.witness.fold(&other.witness, r_b),
+      weights: self.weights.fold(&other.weights, r_b),
     }
   }
 }
@@ -315,8 +305,8 @@ pub fn pc_g_at<F: Field>(
 /// This is a test utility that can be imported by other test modules.
 #[cfg(test)]
 pub(crate) fn compute_pc_weighted_sum_bruteforce<F: Field>(
-  e1: &[F],      // First half of power table (length = left)
-  e2: &[F],      // Second half of power table (length = right)
+  e1: &[F], // First half of power table (length = left)
+  e2: &[F], // Second half of power table (length = right)
   tau: &F,
   w_left: &[F],  // E left weights (length = left, same as main E)
   w_right: &[F], // E right weights (length = right, same as main E)
@@ -345,7 +335,7 @@ pub(crate) fn compute_pc_weighted_sum_bruteforce<F: Field>(
 mod tests {
   use super::*;
   use crate::{
-    neutron::nsc::pc_residual_at, provider::Bn256EngineKZG, r1cs::R1CSShape,
+    neutron::nested_sumcheck::pc_residual_at, provider::Bn256EngineKZG, r1cs::R1CSShape,
     spartan::polys::power::PowPolynomial,
   };
   use ff::Field;
@@ -385,13 +375,7 @@ mod tests {
     table: &WeightTable<E>,
     tau: <E as Engine>::Scalar,
   ) -> <E as Engine>::Scalar {
-    compute_pc_weighted_sum_bruteforce(
-      table.e1(),
-      table.e2(),
-      &tau,
-      weights.e1(),
-      weights.e2(),
-    )
+    compute_pc_weighted_sum_bruteforce(table.e1(), table.e2(), &tau, weights.e1(), weights.e2())
   }
 
   // ============================================================================
@@ -469,14 +453,14 @@ mod tests {
 
     // Test boundary indices for each region
     let boundary_indices = [
-      0,                  // Region 0: base case
-      1,                  // Region 1: first element of chain
-      left - 1,           // Region 1: last element of first half
-      left,               // Region 2: second half base
-      left + 1,           // Region 3: link constraint
-      left + 2,           // Region 4: squaring
-      left + 3,           // Region 5: first element of second half chain
-      left + right - 1,   // Region 5: last element
+      0,                // Region 0: base case
+      1,                // Region 1: first element of chain
+      left - 1,         // Region 1: last element of first half
+      left,             // Region 2: second half base
+      left + 1,         // Region 3: link constraint
+      left + 2,         // Region 4: squaring
+      left + 3,         // Region 5: first element of second half chain
+      left + right - 1, // Region 5: last element
     ];
 
     for &i in &boundary_indices {
@@ -557,7 +541,8 @@ mod tests {
     let folded_tau = (<E as Engine>::Scalar::ONE - r_b) * tau1 + r_b * tau2;
 
     // Compute pc_sumcheck_claim for the folded instance
-    let folded_pc_claim = compute_power_check_sumcheck_claim_naive(&S_pc, &folded_weights, &folded_table, folded_tau);
+    let folded_pc_claim =
+      compute_power_check_sumcheck_claim_naive(&S_pc, &folded_weights, &folded_table, folded_tau);
 
     // A. Folding two DIFFERENT valid tables produces non-zero pc_sumcheck_claim (cross-terms exist)
     assert_ne!(
@@ -570,8 +555,12 @@ mod tests {
     let self_folded_table = table1.fold(&table1, &r_b);
     let self_folded_weights = weights1.fold(&weights1, &r_b);
     let self_folded_tau = tau1; // (1-r_b)*tau1 + r_b*tau1 = tau1
-    let self_folded_pc_claim =
-      compute_power_check_sumcheck_claim_naive(&S_pc, &self_folded_weights, &self_folded_table, self_folded_tau);
+    let self_folded_pc_claim = compute_power_check_sumcheck_claim_naive(
+      &S_pc,
+      &self_folded_weights,
+      &self_folded_table,
+      self_folded_tau,
+    );
     assert_eq!(
       self_folded_pc_claim,
       <E as Engine>::Scalar::ZERO,

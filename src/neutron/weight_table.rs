@@ -1,9 +1,11 @@
 //! This module defines the WeightTable used in both main and PowerCheck relations
+use crate::spartan::polys::power::PowPolynomial;
 use crate::{
   traits::{commitment::CommitmentEngineTrait, Engine},
   Commitment, CommitmentKey,
 };
 use ff::Field;
+use rand_core::OsRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -42,9 +44,6 @@ impl<E: Engine> WeightTable<E> {
   ///
   /// Commitment randomness is drawn from `OsRng` (must be secret for hiding).
   pub fn from_tau(tau: &E::Scalar, left: usize, right: usize) -> Self {
-    use crate::spartan::polys::power::PowPolynomial;
-    use rand_core::OsRng;
-
     let ell = ((left * right) as u32).ilog2() as usize;
     let data = PowPolynomial::new(tau, ell).split_evals(left, right);
     let r = E::Scalar::random(&mut OsRng);
@@ -126,7 +125,8 @@ impl<'de, E: Engine> Deserialize<'de> for WeightTable<E> {
   where
     D: serde::Deserializer<'de>,
   {
-    let (data, r, left): (Vec<E::Scalar>, E::Scalar, usize) = Deserialize::deserialize(deserializer)?;
+    let (data, r, left): (Vec<E::Scalar>, E::Scalar, usize) =
+      Deserialize::deserialize(deserializer)?;
     Ok(Self::new(data, r, left))
   }
 }

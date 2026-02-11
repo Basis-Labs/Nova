@@ -4,7 +4,7 @@ use crate::{
   constants::NUM_CHALLENGE_BITS,
   errors::NovaError,
   neutron::{
-    nsc::convert_to_nsc,
+    nested_sumcheck::convert_to_nsc,
     power_check_relation::{
       FoldedPowerCheckInstance, FoldedPowerCheckWitness, PowerCheckInstance, PowerCheckStructure,
       PowerCheckWitness,
@@ -73,24 +73,18 @@ pub struct NIFSCombinedOutput<E: Engine> {
   /// New ZC_PC (hanging check for next iteration)
   pub new_zc_pc: (PowerCheckInstance<E>, PowerCheckWitness<E>),
 
-  // === Intermediate values for verification ===
+  // === Challenges (needed for verification/reconstruction) ===
   /// τ used to generate E
   pub tau: E::Scalar,
   /// ρ (RLC challenge)
   pub rho: E::Scalar,
   /// r_b (folding challenge)
   pub r_b: E::Scalar,
-  /// NSC instance before folding
-  pub nsc: (FoldedInstance<E>, FoldedWitness<E>),
-  /// (Az, Bz, Cz) for R1CS
-  pub abc: (Vec<E::Scalar>, Vec<E::Scalar>, Vec<E::Scalar>),
-  /// NSC_PC before folding
-  pub nsc_pc: (FoldedPowerCheckInstance<E>, FoldedPowerCheckWitness<E>),
 }
 
 /// Construction 4: Fold both NSC and NSC_PC together
 ///
-/// Folds all linear objects using: running + r_b * (fresh - running)
+/// Folds all linear objects using: a₁ + r_b · (a₂ - a₁)
 /// The weight table E is folded once and shared between NSC witness and PowerCheck witness.
 ///
 /// Returns `FoldedState` containing:
@@ -98,18 +92,26 @@ pub struct NIFSCombinedOutput<E: Engine> {
 /// - Cached Az/Bz/Cz for next iteration (saves one sparse matmul)
 /// - Folded PowerCheck instance and witness
 pub fn fold<E: Engine>(
-  // Main NSC
-  nsc_running: (&FoldedInstance<E>, &FoldedWitness<E>),
-  nsc_fresh: (&FoldedInstance<E>, &FoldedWitness<E>),
-  abc_running: (&[E::Scalar], &[E::Scalar], &[E::Scalar]),
-  abc_fresh: (&[E::Scalar], &[E::Scalar], &[E::Scalar]),
-  // PowerCheck NSC_PC
-  pc_running: (&FoldedPowerCheckInstance<E>, &FoldedPowerCheckWitness<E>),
-  pc_fresh: (&FoldedPowerCheckInstance<E>, &FoldedPowerCheckWitness<E>),
-  // Folding challenge
+  // NSC (1, 2)
+  nsc1: (&FoldedInstance<E>, &FoldedWitness<E>),
+  nsc2: (&FoldedInstance<E>, &FoldedWitness<E>),
+  abc1: (&[E::Scalar], &[E::Scalar], &[E::Scalar]),
+  abc2: (&[E::Scalar], &[E::Scalar], &[E::Scalar]),
+  // PowerCheck (1, 2)
+  pc1: (&FoldedPowerCheckInstance<E>, &FoldedPowerCheckWitness<E>),
+  pc2: (&FoldedPowerCheckInstance<E>, &FoldedPowerCheckWitness<E>),
+  // Challenges and claims
   r_b: &E::Scalar,
+  sumcheck_claim_out_nsc: &E::Scalar,
+  sumcheck_claim_out_pc: &E::Scalar,
 ) -> FoldedState<E> {
-  let one_minus_r = E::Scalar::ONE - r_b;
+  // Destructure for clarity
+  let (U1, W1) = nsc1;
+  let (U2, W2) = nsc2;
+  let (Az1, Bz1, Cz1) = abc1;
+  let (Az2, Bz2, Cz2) = abc2;
+  let (U1_pc, W1_pc) = pc1;
+  let (U2_pc, W2_pc) = pc2;
 
   // Helper: fold two vectors element-wise using a + r_b*(b-a)
   let fold_vec = |v1: &[E::Scalar], v2: &[E::Scalar]| -> Vec<E::Scalar> {
@@ -120,53 +122,21 @@ pub fn fold<E: Engine>(
   };
 
   // ===== Fold E once (shared between NSC witness and PC witness) =====
-  let E = nsc_running.1.E.fold(&nsc_fresh.1.E, r_b);
+  let E = W1.E.fold(&W2.E, r_b);
 
   // ===== Main NSC =====
-  // Note: Commitments use (1-r_b)*a + r_b*b form (Commitment lacks Sub trait)
-  // Scalars use a + r_b*(b-a) form (saves one multiplication)
-  let nsc_instance = FoldedInstance {
-    comm_W: nsc_running.0.comm_W * one_minus_r + nsc_fresh.0.comm_W * *r_b,
-    comm_E: nsc_running.0.comm_E * one_minus_r + nsc_fresh.0.comm_E * *r_b,
-    u: nsc_running.0.u + *r_b * (nsc_fresh.0.u - nsc_running.0.u),
-    X: fold_vec(&nsc_running.0.X, &nsc_fresh.0.X),
-    T: nsc_running.0.T + *r_b * (nsc_fresh.0.T - nsc_running.0.T),
-  };
-
-  let nsc_witness = FoldedWitness::new(
-    fold_vec(&nsc_running.1.W, &nsc_fresh.1.W),
-    nsc_running.1.r_W + *r_b * (nsc_fresh.1.r_W - nsc_running.1.r_W),
-    E.clone(), // Arc clone - cheap!
-  );
+  let nsc_instance = U1.fold_with(U2, r_b, sumcheck_claim_out_nsc);
+  let nsc_witness = W1.fold_with(W2, E.clone(), r_b);
 
   // Fold Az/Bz/Cz in parallel (caching optimization - saves one sparse matmul per iteration)
   let ((Az, Bz), Cz) = rayon::join(
-    || {
-      rayon::join(
-        || fold_vec(abc_running.0, abc_fresh.0),
-        || fold_vec(abc_running.1, abc_fresh.1),
-      )
-    },
-    || fold_vec(abc_running.2, abc_fresh.2),
+    || rayon::join(|| fold_vec(Az1, Az2), || fold_vec(Bz1, Bz2)),
+    || fold_vec(Cz1, Cz2),
   );
 
   // ===== PowerCheck NSC_PC =====
-  let pc_instance = FoldedPowerCheckInstance {
-    pc_sumcheck_claim: pc_running.0.pc_sumcheck_claim
-      + *r_b * (pc_fresh.0.pc_sumcheck_claim - pc_running.0.pc_sumcheck_claim),
-    comm_witness: pc_running.0.comm_witness * one_minus_r + pc_fresh.0.comm_witness * *r_b,
-    comm_weights: pc_running.0.comm_weights * one_minus_r + pc_fresh.0.comm_weights * *r_b,
-    tau: pc_running.0.tau + *r_b * (pc_fresh.0.tau - pc_running.0.tau),
-  };
-
-  // Note: PC witness and weights are folded from their respective sources.
-  // - witness = the power table being checked (from ZC_PC conversion), dimensions (left, right)
-  // - weights = the E_pc weights for sumcheck, dimensions (left_pc, right_pc)
-  // E_pc has different dimensions than NSC E, so we fold weights separately
-  let pc_witness = FoldedPowerCheckWitness {
-    witness: pc_running.1.witness.fold(&pc_fresh.1.witness, r_b),
-    weights: pc_running.1.weights.fold(&pc_fresh.1.weights, r_b),
-  };
+  let pc_instance = U1_pc.fold(U2_pc, r_b, sumcheck_claim_out_pc);
+  let pc_witness = W1_pc.fold(W2_pc, r_b);
 
   FoldedState {
     nsc_instance,
@@ -425,42 +395,43 @@ impl<E: Engine> NIFS<E> {
     Ok(U)
   }
 
-  /// Combined prove for both NSC and NSC_PC
+  /// ZeroFold prover: folds both NSC and NSC_PC (PowerCheck) relations together.
   ///
-  /// Takes running (NSC, NSC_PC) with cached (Az, Bz, Cz), fresh R1CS, and fresh ZC_PC.
+  /// Takes accumulated (NSC, NSC_PC) with cached (Az, Bz, Cz), a fresh zero-check R1CS relation, and a fresh ZC_PC.
   /// Returns folded state plus a new ZC_PC for the next iteration.
   #[allow(clippy::too_many_arguments)]
-  pub fn prove_combined(
+  pub fn prove_zerofold(
     ck: &CommitmentKey<E>,
     ro_consts: &RO2Constants<E>,
     pp_digest: &E::Scalar,
     S: &Structure<E>,
     S_pc: &PowerCheckStructure,
-    // Running NSC
-    nsc_running: (&FoldedInstance<E>, &FoldedWitness<E>),
-    abc_running: (&[E::Scalar], &[E::Scalar], &[E::Scalar]),
-    // Running NSC_PC
-    nsc_pc_running: (&FoldedPowerCheckInstance<E>, &FoldedPowerCheckWitness<E>),
+    // Accumulated NSC
+    nsc: (&FoldedInstance<E>, &FoldedWitness<E>),
+    abc: (&[E::Scalar], &[E::Scalar], &[E::Scalar]),
+    // Accumulated NSC_PC
+    nsc_pc: (&FoldedPowerCheckInstance<E>, &FoldedPowerCheckWitness<E>),
     // Fresh R1CS (ZC)
-    r1cs_fresh: (&R1CSInstance<E>, &R1CSWitness<E>),
+    r1cs: (&R1CSInstance<E>, &R1CSWitness<E>),
     // Fresh ZC_PC (from previous iteration)
-    zc_pc_fresh: (&PowerCheckInstance<E>, &PowerCheckWitness<E>),
+    zc_pc: (&PowerCheckInstance<E>, &PowerCheckWitness<E>),
   ) -> Result<NIFSCombinedOutput<E>, NovaError> {
     // === PHASE 1: Transcript Setup ===
     // Per paper Construction 3: Only absorb FRESH instances before τ.
-    // Running instances are implicitly bound through prior fold transcripts.
+    // Accumulated instances are implicitly bound through prior fold transcripts.
     let mut ro = E::RO2::new(ro_consts.clone());
     ro.absorb(*pp_digest);
 
     // === PHASE 2: ZC to NSC conversion (Construction 3) ===
-    let nsc_conv = convert_to_nsc(ck, S, r1cs_fresh, zc_pc_fresh, &mut ro)?;
-    let tau = nsc_conv.tau;
-    let E = nsc_conv.E;
-    let comm_E = nsc_conv.comm_E;
-    let (Az_fresh, Bz_fresh, Cz_fresh) = (nsc_conv.Az, nsc_conv.Bz, nsc_conv.Cz);
-    let (nsc_fresh_instance, nsc_fresh_witness) = nsc_conv.nsc;
-    let (nsc_pc_fresh_instance, nsc_pc_fresh_witness) = nsc_conv.nsc_pc;
-    let (new_zc_pc_instance, new_zc_pc_witness) = nsc_conv.fresh_pc;
+    let conv = convert_to_nsc(ck, S, r1cs, zc_pc, &mut ro)?;
+
+    // Rebind for fold (1 = accumulated, 2 = converted fresh)
+    let (U1, W1) = nsc;
+    let nsc2 = conv.nsc;
+    let abc1 = abc;
+    let abc2 = (conv.Az.as_slice(), conv.Bz.as_slice(), conv.Cz.as_slice());
+    let (U1_pc, W1_pc) = nsc_pc;
+    let (U2_pc, W2_pc) = conv.nsc_pc;
 
     // === PHASE 3: Squeeze ρ (RLC challenge) ===
     let rho = ro.squeeze(NUM_CHALLENGE_BITS, false);
@@ -470,29 +441,22 @@ impl<E: Engine> NIFS<E> {
     // absorbs the combined poly, squeezes r_b, and computes output claims.
     let sumcheck_out = run_combined_sumfold::<E>(
       &rho,
-      // NSC inputs
-      nsc_running.0.T,
+      // NSC: (1 = accumulated, 2 = fresh)
+      U1.T,
       (S.left, S.right),
-      nsc_running.1.E.as_slice(),
-      abc_running,
-      E.as_slice(),
-      (&Az_fresh, &Bz_fresh, &Cz_fresh),
-      // NSC_PC inputs
-      nsc_pc_running.0.pc_sumcheck_claim,
+      W1.E.as_slice(),
+      abc1,
+      conv.E.as_slice(),
+      abc2,
+      // NSC_PC: (1 = accumulated, 2 = fresh)
+      U1_pc.pc_sumcheck_claim,
       S_pc,
-      (nsc_pc_running.1.weights.e1(), nsc_pc_running.1.weights.e2()),
-      (
-        nsc_pc_fresh_witness.weights.e1(),
-        nsc_pc_fresh_witness.weights.e2(),
-      ),
-      (nsc_pc_running.1.witness.e1(), nsc_pc_running.1.witness.e2()),
-      (
-        nsc_pc_fresh_witness.witness.e1(),
-        nsc_pc_fresh_witness.witness.e2(),
-      ),
-      &nsc_pc_running.0.tau,
-      &nsc_pc_fresh_instance.tau,
-      // Transcript
+      (W1_pc.weights.e1(), W1_pc.weights.e2()),
+      (W2_pc.weights.e1(), W2_pc.weights.e2()),
+      (W1_pc.witness.e1(), W1_pc.witness.e2()),
+      (W2_pc.witness.e1(), W2_pc.witness.e2()),
+      &U1_pc.tau,
+      &U2_pc.tau,
       &mut ro,
     )?;
 
@@ -501,30 +465,29 @@ impl<E: Engine> NIFS<E> {
 
     // === PHASE 5: Fold both NSC and NSC_PC ===
     let folded = fold::<E>(
-      nsc_running,
-      (&nsc_fresh_instance, &nsc_fresh_witness),
-      abc_running,
-      (&Az_fresh, &Bz_fresh, &Cz_fresh),
-      nsc_pc_running,
-      (&nsc_pc_fresh_instance, &nsc_pc_fresh_witness),
+      nsc,
+      (&nsc2.0, &nsc2.1),
+      abc1,
+      (abc2.0, abc2.1, abc2.2),
+      nsc_pc,
+      (&U2_pc, &W2_pc),
       &r_b,
+      &sumcheck_out.sumcheck_claim_out_nsc,
+      &sumcheck_out.sumcheck_claim_out_pc,
     );
 
     // === PHASE 6: Return combined output ===
     Ok(NIFSCombinedOutput {
       nifs: NIFS {
-        comm_E,
+        comm_E: conv.comm_E,
         poly: sumcheck_out.poly,
       },
       gamma,
       folded,
-      new_zc_pc: (new_zc_pc_instance, new_zc_pc_witness),
-      tau,
+      new_zc_pc: conv.zc_pc,
+      tau: conv.tau,
       rho,
       r_b,
-      nsc: (nsc_fresh_instance, nsc_fresh_witness),
-      abc: (Az_fresh, Bz_fresh, Cz_fresh),
-      nsc_pc: (nsc_pc_fresh_instance, nsc_pc_fresh_witness),
     })
   }
 }
@@ -539,14 +502,20 @@ mod tests {
       solver::SatisfyingAssignment,
       Circuit, ConstraintSystem,
     },
-    neutron::nsc::{pc_residual_at, verify_nsc_claim_bruteforce, verify_nsc_pc_claim_bruteforce},
+    neutron::nested_sumcheck::{
+      pc_residual_at, reconstruct_fresh_from_tau, verify_nsc_claim_bruteforce,
+      verify_nsc_pc_claim_bruteforce,
+    },
     provider::{
       hyperkzg::EvaluationEngine as HyperKZGEE, ipa_pc::EvaluationEngine, Bn256EngineKZG,
       PallasEngine, Secp256k1Engine,
     },
     r1cs::R1CSShape,
     spartan::{direct::DirectCircuit, snark::RelaxedR1CSSNARK},
-    traits::{circuit::NonTrivialCircuit, snark::RelaxedR1CSSNARKTrait, Engine, RO2Constants},
+    traits::{
+      circuit::NonTrivialCircuit, commitment::CommitmentEngineTrait, snark::RelaxedR1CSSNARKTrait,
+      Engine, RO2Constants,
+    },
   };
 
   // ============================================================================
@@ -737,6 +706,50 @@ mod tests {
     let sum = poly.eval_at_zero() + poly.eval_at_one();
     if sum != *T_claim {
       return Err(NovaError::InvalidSumcheckProof);
+    }
+    Ok(())
+  }
+
+  /// Verify NSC witness commitment: recompute commitment from witness and check it matches instance
+  fn verify_nsc_witness_commitment<E: Engine>(
+    ck: &CommitmentKey<E>,
+    instance: &FoldedInstance<E>,
+    witness: &FoldedWitness<E>,
+  ) -> Result<(), NovaError> {
+    let comm_W = E::CE::commit(ck, &witness.W, &witness.r_W);
+    let comm_E = witness.E.commit(ck);
+
+    if comm_W != instance.comm_W {
+      return Err(NovaError::UnSat {
+        reason: "NSC comm_W mismatch: recomputed != claimed".to_string(),
+      });
+    }
+    if comm_E != instance.comm_E {
+      return Err(NovaError::UnSat {
+        reason: "NSC comm_E mismatch: recomputed != claimed".to_string(),
+      });
+    }
+    Ok(())
+  }
+
+  /// Verify NSC_PC witness commitment: recompute commitment from witness and check it matches instance
+  fn verify_nsc_pc_witness_commitment<E: Engine>(
+    ck: &CommitmentKey<E>,
+    instance: &FoldedPowerCheckInstance<E>,
+    witness: &FoldedPowerCheckWitness<E>,
+  ) -> Result<(), NovaError> {
+    let comm_witness = witness.witness.commit(ck);
+    let comm_weights = witness.weights.commit(ck);
+
+    if comm_witness != instance.comm_witness {
+      return Err(NovaError::UnSat {
+        reason: "NSC_PC comm_witness mismatch: recomputed != claimed".to_string(),
+      });
+    }
+    if comm_weights != instance.comm_weights {
+      return Err(NovaError::UnSat {
+        reason: "NSC_PC comm_weights mismatch: recomputed != claimed".to_string(),
+      });
     }
     Ok(())
   }
@@ -942,8 +955,8 @@ mod tests {
     // Generate fresh R1CS witness
     let (u_fresh, w_fresh) = generate_satisfying_witness::<E>(&shape, &ck, 2, num_cons);
 
-    // Run prove_combined
-    let result = NIFS::prove_combined(
+    // Run prove_zerofold
+    let result = NIFS::prove_zerofold(
       &ck,
       &ro_consts,
       &pp_digest,
@@ -955,7 +968,7 @@ mod tests {
       (&u_fresh, &w_fresh),
       (&zc_pc_instance, &zc_pc_witness),
     )
-    .expect("prove_combined should succeed");
+    .expect("prove_zerofold should succeed");
 
     // === VERIFY FINAL STATE ===
 
@@ -988,10 +1001,20 @@ mod tests {
 
     // === VERIFY LINEAR FOLDING ===
 
+    // Reconstruct fresh NSC/NSC_PC from tau for verification
+    let fresh = reconstruct_fresh_from_tau::<E>(
+      &str,
+      (&u_fresh, &w_fresh),
+      (&zc_pc_instance, &zc_pc_witness),
+      &result.tau,
+      &result.nifs.comm_E,
+    )
+    .expect("Reconstruction should succeed");
+
     // 5. Verify NSC linear folding
     verify_nsc_linear_folding::<E>(
       (&nsc_instance, &nsc_witness),
-      (&result.nsc.0, &result.nsc.1),
+      (&fresh.nsc.0, &fresh.nsc.1),
       &result.folded,
       &result.r_b,
     )
@@ -1000,7 +1023,7 @@ mod tests {
     // 6. Verify NSC_PC linear folding
     verify_nsc_pc_linear_folding::<E>(
       (&nsc_pc_instance, &nsc_pc_witness),
-      (&result.nsc_pc.0, &result.nsc_pc.1),
+      (&fresh.nsc_pc.0, &fresh.nsc_pc.1),
       &result.folded,
       &result.r_b,
     )
@@ -1009,7 +1032,7 @@ mod tests {
     // 7. Verify commitment homomorphism
     verify_commitment_homomorphism::<E>(
       &nsc_instance,
-      &result.nsc.0,
+      &fresh.nsc.0,
       &result.folded.nsc_instance,
       &result.r_b,
     )
@@ -1021,6 +1044,20 @@ mod tests {
     let combined_claim = T_nsc_claim + result.gamma * T_pc_claim;
     verify_sumcheck_identity::<E>(&result.nifs.poly, &combined_claim)
       .expect("Combined sumcheck identity should hold");
+
+    // 9. Verify witness commitments (recompute and check match)
+    verify_nsc_witness_commitment::<E>(
+      &ck,
+      &result.folded.nsc_instance,
+      &result.folded.nsc_witness,
+    )
+    .expect("NSC witness commitment should match");
+    verify_nsc_pc_witness_commitment::<E>(
+      &ck,
+      &result.folded.pc_instance,
+      &result.folded.pc_witness,
+    )
+    .expect("NSC_PC witness commitment should match");
   }
 
   #[test]
@@ -1049,7 +1086,7 @@ mod tests {
     let (u2, w2) = generate_satisfying_witness::<E>(&shape, &ck, 3, num_cons);
 
     // === FOLD 1 ===
-    let result1 = NIFS::prove_combined(
+    let result1 = NIFS::prove_zerofold(
       &ck,
       &ro_consts,
       &pp_digest,
@@ -1085,27 +1122,50 @@ mod tests {
     .expect("Fold 1: NSC_PC claim should match");
     verify_zc_pc_valid::<E>(&S_pc, &result1.new_zc_pc.0, &result1.new_zc_pc.1)
       .expect("Fold 1: New ZC_PC should be valid");
+
+    // Reconstruct fresh NSC/NSC_PC for fold 1 verification
+    let fresh1 = reconstruct_fresh_from_tau::<E>(
+      &str,
+      (&u1, &w1),
+      (&zc_pc_instance, &zc_pc_witness),
+      &result1.tau,
+      &result1.nifs.comm_E,
+    )
+    .expect("Fold 1: Reconstruction should succeed");
+
     verify_nsc_linear_folding::<E>(
       (&nsc_instance, &nsc_witness),
-      (&result1.nsc.0, &result1.nsc.1),
+      (&fresh1.nsc.0, &fresh1.nsc.1),
       &result1.folded,
       &result1.r_b,
     )
     .expect("Fold 1: NSC linear folding should be correct");
     verify_nsc_pc_linear_folding::<E>(
       (&nsc_pc_instance, &nsc_pc_witness),
-      (&result1.nsc_pc.0, &result1.nsc_pc.1),
+      (&fresh1.nsc_pc.0, &fresh1.nsc_pc.1),
       &result1.folded,
       &result1.r_b,
     )
     .expect("Fold 1: NSC_PC linear folding should be correct");
     verify_nsc_pc_commitment_homomorphism::<E>(
       &nsc_pc_instance,
-      &result1.nsc_pc.0,
+      &fresh1.nsc_pc.0,
       &result1.folded.pc_instance,
       &result1.r_b,
     )
     .expect("Fold 1: NSC_PC commitment homomorphism should hold");
+    verify_nsc_witness_commitment::<E>(
+      &ck,
+      &result1.folded.nsc_instance,
+      &result1.folded.nsc_witness,
+    )
+    .expect("Fold 1: NSC witness commitment should match");
+    verify_nsc_pc_witness_commitment::<E>(
+      &ck,
+      &result1.folded.pc_instance,
+      &result1.folded.pc_witness,
+    )
+    .expect("Fold 1: NSC_PC witness commitment should match");
 
     // Update running state
     nsc_instance = result1.folded.nsc_instance.clone();
@@ -1121,7 +1181,7 @@ mod tests {
     zc_pc_witness = result1.new_zc_pc.1.clone();
 
     // === FOLD 2 ===
-    let result2 = NIFS::prove_combined(
+    let result2 = NIFS::prove_zerofold(
       &ck,
       &ro_consts,
       &pp_digest,
@@ -1158,27 +1218,50 @@ mod tests {
     .expect("Fold 2: NSC_PC claim should match");
     verify_zc_pc_valid::<E>(&S_pc, &result2.new_zc_pc.0, &result2.new_zc_pc.1)
       .expect("Fold 2: New ZC_PC should be valid");
+
+    // Reconstruct fresh NSC/NSC_PC for fold 2 verification
+    let fresh2 = reconstruct_fresh_from_tau::<E>(
+      &str,
+      (&u2, &w2),
+      (&zc_pc_instance, &zc_pc_witness),
+      &result2.tau,
+      &result2.nifs.comm_E,
+    )
+    .expect("Fold 2: Reconstruction should succeed");
+
     verify_nsc_linear_folding::<E>(
       (&nsc_instance, &nsc_witness),
-      (&result2.nsc.0, &result2.nsc.1),
+      (&fresh2.nsc.0, &fresh2.nsc.1),
       &result2.folded,
       &result2.r_b,
     )
     .expect("Fold 2: NSC linear folding should be correct");
     verify_nsc_pc_linear_folding::<E>(
       (&nsc_pc_instance, &nsc_pc_witness),
-      (&result2.nsc_pc.0, &result2.nsc_pc.1),
+      (&fresh2.nsc_pc.0, &fresh2.nsc_pc.1),
       &result2.folded,
       &result2.r_b,
     )
     .expect("Fold 2: NSC_PC linear folding should be correct");
     verify_nsc_pc_commitment_homomorphism::<E>(
       &nsc_pc_instance,
-      &result2.nsc_pc.0,
+      &fresh2.nsc_pc.0,
       &result2.folded.pc_instance,
       &result2.r_b,
     )
     .expect("Fold 2: NSC_PC commitment homomorphism should hold");
+    verify_nsc_witness_commitment::<E>(
+      &ck,
+      &result2.folded.nsc_instance,
+      &result2.folded.nsc_witness,
+    )
+    .expect("Fold 2: NSC witness commitment should match");
+    verify_nsc_pc_witness_commitment::<E>(
+      &ck,
+      &result2.folded.pc_instance,
+      &result2.folded.pc_witness,
+    )
+    .expect("Fold 2: NSC_PC witness commitment should match");
 
     // Verify sumcheck accumulation
     let T_nsc_claim = (E::Scalar::ONE - result2.rho) * nsc_instance.T;
@@ -1213,7 +1296,7 @@ mod tests {
       .collect();
 
     for (step, (u, w)) in witnesses.iter().enumerate() {
-      let result = NIFS::prove_combined(
+      let result = NIFS::prove_zerofold(
         &ck,
         &ro_consts,
         &pp_digest,
@@ -1225,7 +1308,7 @@ mod tests {
         (u, w),
         (&zc_pc_instance, &zc_pc_witness),
       )
-      .unwrap_or_else(|e| panic!("Step {}: prove_combined failed: {:?}", step, e));
+      .unwrap_or_else(|e| panic!("Step {}: prove_zerofold failed: {:?}", step, e));
 
       // Verify all invariants
       str
@@ -1246,23 +1329,34 @@ mod tests {
       .unwrap_or_else(|e| panic!("Step {}: NSC_PC claim failed: {:?}", step, e));
       verify_zc_pc_valid::<E>(&S_pc, &result.new_zc_pc.0, &result.new_zc_pc.1)
         .unwrap_or_else(|e| panic!("Step {}: ZC_PC validity failed: {:?}", step, e));
+
+      // Reconstruct fresh NSC/NSC_PC for verification
+      let fresh = reconstruct_fresh_from_tau::<E>(
+        &str,
+        (u, w),
+        (&zc_pc_instance, &zc_pc_witness),
+        &result.tau,
+        &result.nifs.comm_E,
+      )
+      .unwrap_or_else(|e| panic!("Step {}: Reconstruction failed: {:?}", step, e));
+
       verify_nsc_linear_folding::<E>(
         (&nsc_instance, &nsc_witness),
-        (&result.nsc.0, &result.nsc.1),
+        (&fresh.nsc.0, &fresh.nsc.1),
         &result.folded,
         &result.r_b,
       )
       .unwrap_or_else(|e| panic!("Step {}: NSC linear folding failed: {:?}", step, e));
       verify_nsc_pc_linear_folding::<E>(
         (&nsc_pc_instance, &nsc_pc_witness),
-        (&result.nsc_pc.0, &result.nsc_pc.1),
+        (&fresh.nsc_pc.0, &fresh.nsc_pc.1),
         &result.folded,
         &result.r_b,
       )
       .unwrap_or_else(|e| panic!("Step {}: NSC_PC linear folding failed: {:?}", step, e));
       verify_nsc_pc_commitment_homomorphism::<E>(
         &nsc_pc_instance,
-        &result.nsc_pc.0,
+        &fresh.nsc_pc.0,
         &result.folded.pc_instance,
         &result.r_b,
       )
@@ -1272,6 +1366,18 @@ mod tests {
           step, e
         )
       });
+      verify_nsc_witness_commitment::<E>(
+        &ck,
+        &result.folded.nsc_instance,
+        &result.folded.nsc_witness,
+      )
+      .unwrap_or_else(|e| panic!("Step {}: NSC witness commitment mismatch: {:?}", step, e));
+      verify_nsc_pc_witness_commitment::<E>(
+        &ck,
+        &result.folded.pc_instance,
+        &result.folded.pc_witness,
+      )
+      .unwrap_or_else(|e| panic!("Step {}: NSC_PC witness commitment mismatch: {:?}", step, e));
 
       // Update running state
       nsc_instance = result.folded.nsc_instance;
@@ -1297,7 +1403,7 @@ mod tests {
   /// - This is already verified by verify_nsc_pc_claim_bruteforce in test_three_step_folding
   ///
   /// This test additionally verifies the T_out computation:
-  /// T_out_pc = poly_pc.evaluate(r_b) * eq_rho_r_b_inv
+  /// sumcheck_claim_out_pc = poly_pc.evaluate(r_b) * eq_rho_r_b_inv
   fn test_pc_claim_accumulation_with<E: Engine, S: RelaxedR1CSSNARKTrait<E>>() {
     let ro_consts = RO2Constants::<E>::default();
     let pp_digest = E::Scalar::ZERO;
@@ -1319,7 +1425,7 @@ mod tests {
       .collect();
 
     for (step, (u, w)) in witnesses.iter().enumerate() {
-      let result = NIFS::prove_combined(
+      let result = NIFS::prove_zerofold(
         &ck,
         &ro_consts,
         &pp_digest,
@@ -1331,7 +1437,7 @@ mod tests {
         (u, w),
         (&zc_pc_instance, &zc_pc_witness),
       )
-      .unwrap_or_else(|e| panic!("Step {}: prove_combined failed: {:?}", step, e));
+      .unwrap_or_else(|e| panic!("Step {}: prove_zerofold failed: {:?}", step, e));
 
       // Verify the combined sumcheck polynomial identity: poly(0) + poly(1) = T_nsc + γ·T_pc
       let T_nsc_claim = (E::Scalar::ONE - result.rho) * nsc_instance.T;

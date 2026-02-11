@@ -5,8 +5,8 @@ use crate::{
   errors::NovaError,
   neutron::{
     power_check_relation::{
-      fresh_power_check, FoldedPowerCheckInstance, FoldedPowerCheckWitness, PowerCheckInstance,
-      PowerCheckWitness,
+      generate_power_check_relation, FoldedPowerCheckInstance, FoldedPowerCheckWitness,
+      PowerCheckInstance, PowerCheckWitness,
     },
     relation::{FoldedInstance, FoldedWitness, Structure},
     weight_table::WeightTable,
@@ -46,7 +46,7 @@ pub struct NSCConversionOutput<E: Engine> {
   pub nsc_pc: (FoldedPowerCheckInstance<E>, FoldedPowerCheckWitness<E>),
 
   /// Fresh PowerCheck instance (the "hanging" ZC_PC to be checked later)
-  pub fresh_pc: (PowerCheckInstance<E>, PowerCheckWitness<E>),
+  pub zc_pc: (PowerCheckInstance<E>, PowerCheckWitness<E>),
 }
 
 /// Construction 3: Convert zero-check to nested sum-check
@@ -77,7 +77,8 @@ pub fn convert_to_nsc<E: Engine>(
   // This creates E = [1, τ, τ², ...] and commits to it.
   // IMPORTANT: E has main domain dimensions (left × right) for BOTH
   // the main NSC and NSC_PC sumchecks. PowerCheck constraints are padded.
-  let (fresh_pc_instance, fresh_pc_witness) = fresh_power_check(&tau, S.left, S.right, ck);
+  let (fresh_pc_instance, fresh_pc_witness) =
+    generate_power_check_relation(&tau, S.left, S.right, ck);
   let E = fresh_pc_witness.powers.clone();
   let comm_E: Commitment<E> = fresh_pc_instance.comm_powers;
 
@@ -114,7 +115,63 @@ pub fn convert_to_nsc<E: Engine>(
     Cz,
     nsc: (nsc_instance, nsc_witness),
     nsc_pc: (nsc_pc_instance, nsc_pc_witness),
-    fresh_pc: (fresh_pc_instance, fresh_pc_witness),
+    zc_pc: (fresh_pc_instance, fresh_pc_witness),
+  })
+}
+
+// ============================================================================
+// Test Reconstruction Helpers
+// ============================================================================
+
+#[cfg(test)]
+use super::power_check_relation::PowerCheckStructure;
+
+/// Output of fresh NSC/NSC_PC reconstruction for test verification
+#[cfg(test)]
+pub(crate) struct ReconstructedFresh<E: Engine> {
+  /// Fresh NSC instance/witness (reconstructed)
+  pub nsc: (FoldedInstance<E>, FoldedWitness<E>),
+  /// Fresh NSC_PC instance/witness (reconstructed)
+  pub nsc_pc: (FoldedPowerCheckInstance<E>, FoldedPowerCheckWitness<E>),
+}
+
+/// Reconstruct fresh NSC/NSC_PC from inputs and tau (for test verification)
+///
+/// This regenerates the fresh instances/witnesses that would have been created
+/// by `convert_to_nsc`, using the known `tau`. The commitment randomness `r`
+/// in the weight table will differ from the original, but linear folding checks
+/// only verify data values, not randomness.
+#[cfg(test)]
+pub(crate) fn reconstruct_fresh_from_tau<E: Engine>(
+  S: &Structure<E>,
+  zc: (&R1CSInstance<E>, &R1CSWitness<E>),
+  zc_pc: (&PowerCheckInstance<E>, &PowerCheckWitness<E>),
+  tau: &E::Scalar,
+  comm_E: &Commitment<E>,
+) -> Result<ReconstructedFresh<E>, NovaError> {
+  let (u_fresh, w_fresh) = zc;
+  let (zc_pc_instance, zc_pc_witness) = zc_pc;
+
+  // Regenerate E from tau (data is deterministic, r differs but unused)
+  let E = WeightTable::from_tau(tau, S.left, S.right);
+
+  // Create fresh NSC instance/witness
+  let nsc_instance = FoldedInstance {
+    comm_W: u_fresh.comm_W,
+    comm_E: *comm_E,
+    T: E::Scalar::ZERO,
+    u: E::Scalar::ONE,
+    X: u_fresh.X.clone(),
+  };
+  let nsc_witness = FoldedWitness::from_r1cs(w_fresh, E.clone());
+
+  // Create fresh NSC_PC instance/witness
+  let nsc_pc_instance = FoldedPowerCheckInstance::from_fresh_zc_pc(zc_pc_instance, *comm_E);
+  let nsc_pc_witness = FoldedPowerCheckWitness::from_fresh_zc_pc(zc_pc_witness, E);
+
+  Ok(ReconstructedFresh {
+    nsc: (nsc_instance, nsc_witness),
+    nsc_pc: (nsc_pc_instance, nsc_pc_witness),
   })
 }
 
@@ -123,7 +180,7 @@ pub fn convert_to_nsc<E: Engine>(
 // ============================================================================
 
 #[cfg(test)]
-use super::power_check_relation::{pc_g_at, PowerCheckStructure};
+use super::power_check_relation::pc_g_at;
 
 /// Compute residual F_PC = g₁ - g₂·g₃ at index i.
 ///
@@ -215,4 +272,112 @@ pub(crate) fn verify_nsc_pc_claim_bruteforce<E: Engine>(
     });
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::{
+    frontend::{
+      r1cs::{NovaShape, NovaWitness},
+      shape_cs::ShapeCS,
+      solver::SatisfyingAssignment,
+      Circuit, ConstraintSystem,
+    },
+    neutron::power_check_relation::generate_power_check_relation,
+    provider::PallasEngine,
+    r1cs::R1CSShape,
+    spartan::{direct::DirectCircuit, snark::RelaxedR1CSSNARK},
+    traits::{circuit::NonTrivialCircuit, snark::RelaxedR1CSSNARKTrait, Engine, RO2Constants},
+  };
+
+  type E = PallasEngine;
+  type S = RelaxedR1CSSNARK<E, crate::provider::ipa_pc::EvaluationEngine<E>>;
+
+  fn generate_test_circuit<E: Engine, S: RelaxedR1CSSNARKTrait<E>>(
+    num_cons: usize,
+  ) -> (R1CSShape<E>, CommitmentKey<E>) {
+    let circuit: DirectCircuit<E, NonTrivialCircuit<E::Scalar>> =
+      DirectCircuit::new(None, NonTrivialCircuit::<E::Scalar>::new(num_cons));
+
+    let mut cs: ShapeCS<E> = ShapeCS::new();
+    let _ = circuit.synthesize(&mut cs);
+    let shape = cs.r1cs_shape().unwrap();
+    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+
+    let shape = shape.pad();
+    (shape, ck)
+  }
+
+  fn generate_satisfying_witness<E: Engine>(
+    shape: &R1CSShape<E>,
+    ck: &CommitmentKey<E>,
+    input: u64,
+    num_cons: usize,
+  ) -> (R1CSInstance<E>, R1CSWitness<E>) {
+    let circuit: DirectCircuit<E, NonTrivialCircuit<E::Scalar>> = DirectCircuit::new(
+      Some(vec![E::Scalar::from(input)]),
+      NonTrivialCircuit::<E::Scalar>::new(num_cons),
+    );
+
+    let mut cs = SatisfyingAssignment::<E>::new();
+    let _ = circuit.synthesize(&mut cs);
+    let (u, w) = cs.r1cs_instance_and_witness(shape, ck).unwrap();
+    let w = w.pad(shape);
+    (u, w)
+  }
+
+  /// Test that convert_to_nsc produces NSC and NSC_PC instances with zero claims
+  /// and that the brute-force verification confirms this.
+  #[test]
+  fn test_convert_to_nsc_claims_are_zero() {
+    let num_cons = 16;
+    let (shape, ck) = generate_test_circuit::<E, S>(num_cons);
+    let str = Structure::new(&shape);
+    let S_pc = PowerCheckStructure::from_main(&str);
+
+    // Create fresh R1CS instance/witness (this is the ZC)
+    let (zc_instance, zc_witness) = generate_satisfying_witness::<E>(&shape, &ck, 42, num_cons);
+
+    // Create fresh ZC_PC (the input PowerCheck to be converted)
+    let tau_input = <E as Engine>::Scalar::from(123u64);
+    let (zc_pc_instance, zc_pc_witness) =
+      generate_power_check_relation(&tau_input, str.left, str.right, &ck);
+
+    // Set up transcript
+    let ro_consts: RO2Constants<E> = RO2Constants::<E>::default();
+    let mut transcript = <E as Engine>::RO2::new(ro_consts);
+
+    // Call convert_to_nsc
+    let output = convert_to_nsc::<E>(
+      &ck,
+      &str,
+      (&zc_instance, &zc_witness),
+      (&zc_pc_instance, &zc_pc_witness),
+      &mut transcript,
+    )
+    .expect("convert_to_nsc should succeed");
+
+    // Verify NSC claim is zero
+    assert_eq!(
+      output.nsc.0.T,
+      <E as Engine>::Scalar::ZERO,
+      "NSC instance T should be zero"
+    );
+
+    // Verify NSC_PC claim is zero
+    assert_eq!(
+      output.nsc_pc.0.pc_sumcheck_claim,
+      <E as Engine>::Scalar::ZERO,
+      "NSC_PC instance pc_sumcheck_claim should be zero"
+    );
+
+    // Verify NSC claim via brute-force computation
+    verify_nsc_claim_bruteforce::<E>(&str, &output.nsc.0, &output.nsc.1)
+      .expect("NSC brute-force verification should pass");
+
+    // Verify NSC_PC claim via brute-force computation
+    verify_nsc_pc_claim_bruteforce::<E>(&S_pc, &output.nsc_pc.0, &output.nsc_pc.1)
+      .expect("NSC_PC brute-force verification should pass");
+  }
 }

@@ -163,6 +163,24 @@ impl<E: Engine> FoldedWitness<E> {
 
     Ok(Self { W, r_W, E })
   }
+
+  /// Fold two FoldedWitnesses together
+  ///
+  /// Unlike `fold` which folds with a fresh R1CSWitness, this folds two
+  /// already-folded witnesses. The weight table E must be pre-folded and
+  /// passed in (it's shared between NSC and PowerCheck witnesses).
+  pub fn fold_with(&self, other: &Self, E: WeightTable<E>, r_b: &E::Scalar) -> Self {
+    Self {
+      W: self
+        .W
+        .par_iter()
+        .zip(other.W.par_iter())
+        .map(|(a, b)| *a + *r_b * (*b - *a))
+        .collect(),
+      r_W: self.r_W + *r_b * (other.r_W - self.r_W),
+      E,
+    }
+  }
 }
 
 impl<E: Engine> FoldedInstance<E> {
@@ -203,6 +221,26 @@ impl<E: Engine> FoldedInstance<E> {
       u,
       X,
     })
+  }
+
+  /// Fold two FoldedInstances together
+  ///
+  /// Unlike `fold` which folds with a fresh R1CSInstance, this folds two
+  /// already-folded instances.
+  pub fn fold_with(&self, other: &Self, r_b: &E::Scalar, T_out: &E::Scalar) -> Self {
+    let one_minus_r = E::Scalar::ONE - r_b;
+    Self {
+      comm_W: self.comm_W * one_minus_r + other.comm_W * *r_b,
+      comm_E: self.comm_E * one_minus_r + other.comm_E * *r_b,
+      u: self.u + *r_b * (other.u - self.u),
+      X: self
+        .X
+        .par_iter()
+        .zip(other.X.par_iter())
+        .map(|(a, b)| *a + *r_b * (*b - *a))
+        .collect(),
+      T: *T_out,
+    }
   }
 }
 
