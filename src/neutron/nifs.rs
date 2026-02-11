@@ -56,11 +56,12 @@ pub struct FoldedState<E: Engine> {
 }
 
 /// PowerCheck NIFS proof (separate sumcheck polynomial from main NIFS)
+///
+/// Note: Uses the same E as main NIFS (comm_E is shared).
+/// PowerCheck constraints are padded to main domain dimensions.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct NIFSPowerCheck<E: Engine> {
-  /// Commitment to E_pc (same as nifs.comm_E - shared)
-  pub(crate) comm_E_pc: Commitment<E>,
   /// PowerCheck sumcheck polynomial
   pub(crate) poly_pc: UniPoly<E::Scalar>,
 }
@@ -435,14 +436,10 @@ impl<E: Engine> NIFS<E> {
     zc_pc_fresh: (&PowerCheckInstance<E>, &PowerCheckWitness<E>),
   ) -> Result<NIFSCombinedOutput<E>, NovaError> {
     // === PHASE 1: Transcript Setup ===
+    // Per paper Construction 3: Only absorb FRESH instances before τ.
+    // Running instances are implicitly bound through prior fold transcripts.
     let mut ro = E::RO2::new(ro_consts.clone());
     ro.absorb(*pp_digest);
-
-    // Absorb running NSC instance
-    nsc_running.0.absorb_in_ro2(&mut ro);
-
-    // Absorb running NSC_PC instance
-    nsc_pc_running.0.absorb_in_ro2(&mut ro);
 
     // Absorb fresh R1CS instance
     r1cs_fresh.0.absorb_in_ro2(&mut ro);
@@ -453,21 +450,15 @@ impl<E: Engine> NIFS<E> {
     // === PHASE 2: Generate τ and create E ===
     let tau = ro.squeeze(NUM_CHALLENGE_BITS, false);
 
-    // Create power polynomial E for main NSC - dimensions (left, right)
+    // Create power polynomial E for BOTH main NSC and NSC_PC - dimensions (left, right)
+    // PowerCheck constraints (num_cons = left + right) are padded to main domain (left × right).
+    // The sumcheck skips indices >= num_cons.
     let E_vec = PowPolynomial::new(&tau, S.ell).split_evals(S.left, S.right);
     let r_E = E::Scalar::random(&mut OsRng);
     let E = WeightTable::new(E_vec, r_E, S.left);
     let comm_E: Commitment<E> = E.commit(ck);
 
-    // Create E_pc for PowerCheck sumcheck - dimensions (left_pc, right_pc)
-    let ell_pc = (S_pc.left_pc * S_pc.right_pc).ilog2() as usize;
-    let E_pc_vec = PowPolynomial::new(&tau, ell_pc).split_evals(S_pc.left_pc, S_pc.right_pc);
-    let r_E_pc = E::Scalar::random(&mut OsRng);
-    let E_pc = WeightTable::new(E_pc_vec, r_E_pc, S_pc.left_pc);
-    let comm_E_pc: Commitment<E> = E_pc.commit(ck);
-
     comm_E.absorb_in_ro2(&mut ro);
-    comm_E_pc.absorb_in_ro2(&mut ro);
 
     // === PHASE 3: Squeeze ρ (RLC challenge) ===
     let rho = ro.squeeze(NUM_CHALLENGE_BITS, false);
@@ -499,17 +490,9 @@ impl<E: Engine> NIFS<E> {
 
     // === PHASE 7: Convert ZC_PC to NSC_PC form ===
     // Note: The fresh ZC_PC's power table becomes the witness,
-    // and E_pc (with dimensions left_pc, right_pc) becomes the weights
-    let nsc_pc_fresh_instance = FoldedPowerCheckInstance {
-      pc_sumcheck_claim: E::Scalar::ZERO, // Fresh has zero error
-      comm_witness: zc_pc_fresh.0.comm_powers,
-      comm_weights: comm_E_pc,
-      tau: zc_pc_fresh.0.tau,
-    };
-    let nsc_pc_fresh_witness = FoldedPowerCheckWitness {
-      witness: zc_pc_fresh.1.powers.clone(),
-      weights: E_pc.clone(),
-    };
+    // and E (same as main NSC, padded domain) becomes the weights
+    let nsc_pc_fresh_instance = FoldedPowerCheckInstance::from_fresh_zc_pc(zc_pc_fresh.0, comm_E);
+    let nsc_pc_fresh_witness = FoldedPowerCheckWitness::from_fresh_zc_pc(zc_pc_fresh.1, E.clone());
 
     // === PHASE 8: Run NSC sumcheck (prove_helper) ===
     let (e0_nsc, e2_nsc, e3_nsc, e4_nsc, e5_nsc): EvalAcc<E::Scalar> = prove_helper::<E>(
@@ -589,10 +572,7 @@ impl<E: Engine> NIFS<E> {
         comm_E,
         poly: poly_nsc,
       },
-      nifs_pc: NIFSPowerCheck {
-        comm_E_pc: comm_E_pc,
-        poly_pc,
-      },
+      nifs_pc: NIFSPowerCheck { poly_pc },
       folded,
       new_zc_pc: (new_zc_pc_instance, new_zc_pc_witness),
       tau,
@@ -1438,6 +1418,84 @@ mod tests {
   fn test_three_step_folding() {
     test_three_step_folding_with::<Bn256EngineKZG, RelaxedR1CSSNARK<_, HyperKZGEE<_>>>();
     test_three_step_folding_with::<PallasEngine, RelaxedR1CSSNARK<_, EvaluationEngine<_>>>();
+  }
+
+  /// Test that pc_sumcheck_claim is correctly computed after multiple folds.
+  ///
+  /// The key relationship verified:
+  /// - After each fold, the bruteforce pc_sumcheck_claim matches the instance claim
+  /// - This is already verified by verify_nsc_pc_claim_bruteforce in test_three_step_folding
+  ///
+  /// This test additionally verifies the T_out computation:
+  /// T_out_pc = poly_pc.evaluate(r_b) * eq_rho_r_b_inv
+  fn test_pc_claim_accumulation_with<E: Engine, S: RelaxedR1CSSNARKTrait<E>>() {
+    let ro_consts = RO2Constants::<E>::default();
+    let pp_digest = E::Scalar::ZERO;
+    let num_cons = 32usize;
+
+    // Setup
+    let (shape, ck) = generate_test_circuit::<E, S>(num_cons);
+    let str = Structure::new(&shape);
+    let S_pc = PowerCheckStructure::from_main(&str);
+
+    // Initialize with zeros
+    let (mut nsc_instance, mut nsc_witness, mut abc) = setup_nsc::<E>(&str);
+    let (mut nsc_pc_instance, mut nsc_pc_witness) = setup_nsc_pc::<E>(&ck, &S_pc);
+    let (mut zc_pc_instance, mut zc_pc_witness) = setup_zc_pc::<E>(&ck, &S_pc);
+
+    // Generate witnesses
+    let witnesses: Vec<_> = (2..5)
+      .map(|i| generate_satisfying_witness::<E>(&shape, &ck, i, num_cons))
+      .collect();
+
+    for (step, (u, w)) in witnesses.iter().enumerate() {
+      let result = NIFS::prove_combined(
+        &ck,
+        &ro_consts,
+        &pp_digest,
+        &str,
+        &S_pc,
+        (&nsc_instance, &nsc_witness),
+        (&abc.0, &abc.1, &abc.2),
+        (&nsc_pc_instance, &nsc_pc_witness),
+        (u, w),
+        (&zc_pc_instance, &zc_pc_witness),
+      )
+      .unwrap_or_else(|e| panic!("Step {}: prove_combined failed: {:?}", step, e));
+
+      // Verify the sumcheck polynomial identity for PC
+      let T_pc_claim =
+        (E::Scalar::ONE - result.rho) * nsc_pc_instance.pc_sumcheck_claim + result.rho * E::Scalar::ZERO;
+      verify_sumcheck_identity::<E>(&result.nifs_pc.poly_pc, &T_pc_claim)
+        .unwrap_or_else(|e| panic!("Step {}: PC sumcheck identity failed: {:?}", step, e));
+
+      // Verify T_out computation: T_out = poly(r_b) / eq(ρ, r_b)
+      let eq_rho_r_b =
+        (E::Scalar::ONE - result.rho) * (E::Scalar::ONE - result.r_b) + result.rho * result.r_b;
+      let eq_rho_r_b_inv: E::Scalar =
+        Option::from(eq_rho_r_b.invert()).expect("eq_rho_r_b should be invertible");
+      let expected_T_out = result.nifs_pc.poly_pc.evaluate(&result.r_b) * eq_rho_r_b_inv;
+      assert_eq!(
+        result.folded.pc_instance.pc_sumcheck_claim,
+        expected_T_out,
+        "Step {}: pc_sumcheck_claim should equal T_out = poly(r_b) / eq(ρ, r_b)",
+        step
+      );
+
+      // Update running state
+      nsc_instance = result.folded.nsc_instance;
+      nsc_witness = result.folded.nsc_witness;
+      abc = (result.folded.Az, result.folded.Bz, result.folded.Cz);
+      nsc_pc_instance = result.folded.pc_instance;
+      nsc_pc_witness = result.folded.pc_witness;
+      zc_pc_instance = result.new_zc_pc.0;
+      zc_pc_witness = result.new_zc_pc.1;
+    }
+  }
+
+  #[test]
+  fn test_pc_claim_accumulation() {
+    test_pc_claim_accumulation_with::<Bn256EngineKZG, RelaxedR1CSSNARK<_, HyperKZGEE<_>>>();
   }
 }
 

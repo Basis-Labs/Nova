@@ -281,31 +281,28 @@ pub fn prove_helper<E: Engine>(
 pub fn prove_helper_pc<E: Engine>(
   rho: &E::Scalar,
   S_pc: &PowerCheckStructure,
-  // E_pc weights [left_pc, right_pc] for running and fresh instances
-  weights_1: (&[E::Scalar], &[E::Scalar]), // Running (left, right)
-  weights_2: (&[E::Scalar], &[E::Scalar]), // Fresh (left, right)
-  // PowerCheck witness [e₁, e₂] for running and fresh instances
-  wit_1: (&[E::Scalar], &[E::Scalar]), // Running (e1, e2)
-  wit_2: (&[E::Scalar], &[E::Scalar]), // Fresh (e1, e2)
+  weights_1: (&[E::Scalar], &[E::Scalar]),
+  weights_2: (&[E::Scalar], &[E::Scalar]),
+  w1: (&[E::Scalar], &[E::Scalar]),
+  w2: (&[E::Scalar], &[E::Scalar]),
   tau_1: &E::Scalar,
   tau_2: &E::Scalar,
 ) -> EvalAcc<E::Scalar> {
   let (w1_left, w1_right) = weights_1;
   let (w2_left, w2_right) = weights_2;
-  let (e1_1, e1_2) = wit_1; // Running: e1_1 = first half, e1_2 = second half
-  let (e2_1, e2_2) = wit_2; // Fresh: e2_1 = first half, e2_2 = second half
+  let (e1_1, e1_2) = w1;
+  let (e2_1, e2_2) = w2;
 
   let left = S_pc.left;
   let right = S_pc.right;
   let num_cons = S_pc.num_cons; // = left + right
-  let left_pc = S_pc.left_pc;
-  let right_pc = S_pc.right_pc;
 
-  // Sanity checks
-  debug_assert_eq!(w1_left.len(), left_pc);
-  debug_assert_eq!(w1_right.len(), right_pc);
-  debug_assert_eq!(w2_left.len(), left_pc);
-  debug_assert_eq!(w2_right.len(), right_pc);
+  // Weights use MAIN domain dimensions (left, right), same as main E
+  // This ensures we use the same weight table E for both NSC and NSC_PC sumchecks
+  debug_assert_eq!(w1_left.len(), left);
+  debug_assert_eq!(w1_right.len(), right);
+  debug_assert_eq!(w2_left.len(), left);
+  debug_assert_eq!(w2_right.len(), right);
   debug_assert_eq!(e1_1.len(), left);
   debug_assert_eq!(e1_2.len(), right);
   debug_assert_eq!(e2_1.len(), left);
@@ -345,7 +342,7 @@ pub fn prove_helper_pc<E: Engine>(
   // ==========================================================================
   // Nested loop for correct tensor-product interpolation
   //
-  // E_pc has tensor structure: E_pc[i] = w_right[row] × w_left[col]
+  // E has tensor structure: E[i] = w_right[row] × w_left[col]
   // When folding, each factor interpolates linearly:
   //   w_left(t) = w1_left + t·(w2_left - w1_left)
   //   w_right(t) = w1_right + t·(w2_right - w1_right)
@@ -356,19 +353,22 @@ pub fn prove_helper_pc<E: Engine>(
   // Solution: nested loops (mirrors prove_helper for R1CS)
   // - Inner loop: interpolate w_left[col] linearly
   // - Outer loop: multiply by w_right[row] interpolated at the same point
+  //
+  // NOTE: We iterate over the MAIN domain (left × right), but only num_cons = left + right
+  // positions have real constraints. Indices >= num_cons are padding and skipped.
   // ==========================================================================
 
-  let acc = (0..right_pc)
+  let acc = (0..right)
     .into_par_iter()
     .fold(zero_acc, |outer_acc, row| {
       // ========================================
       // Inner loop: linearly interpolate w_left[col] at points {0, 2, 3, 4, 5}
       // Computes: inner_acc[pt] = Σⱼ comb(w_left(pt)[col], g1(pt), g2(pt), g3(pt))
       // ========================================
-      let inner_acc = (0..left_pc).fold(zero_acc(), |acc, col| {
-        let i = row * left_pc + col;
+      let inner_acc = (0..left).fold(zero_acc(), |acc, col| {
+        let i = row * left + col;
         if i >= num_cons {
-          return acc; // Skip padding
+          return acc; // Skip padding - most iterations will hit this
         }
 
         let (g1_1, g2_1, g3_1) = get_g_values(i, e1_1, e1_2, tau_1);
@@ -423,57 +423,11 @@ pub fn prove_helper_pc<E: Engine>(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{provider::PallasEngine, spartan::polys::univariate::UniPoly};
-
-  /// Brute-force computation of PowerCheck weighted sum for testing.
-  /// Computes: pc_sumcheck_claim = Σᵢ E_pc_weight(i) · (g₁[i] - g₂[i]·g₃[i])
-  fn compute_pc_weighted_sum_bruteforce<F: Field>(
-    e1: &[F],      // First half of power table
-    e2: &[F],      // Second half of power table
-    tau: &F,
-    w_left: &[F],  // E_pc left weights
-    w_right: &[F], // E_pc right weights
-    left_pc: usize,
-  ) -> F {
-    let left = e1.len();
-    let right = e2.len();
-    let num_cons = left + right;
-
-    (0..num_cons)
-      .map(|i| {
-        // Compute (g1, g2, g3) based on region
-        let (g1, g2, g3) = if i == 0 {
-          // Region 0: base case
-          (e1[0], F::ONE, F::ONE)
-        } else if i < left {
-          // Region 1: first half chain
-          (e1[i], e1[i - 1], *tau)
-        } else if i == left {
-          // Region 2: second half base
-          (e2[0], F::ONE, F::ONE)
-        } else if i == left + 1 {
-          // Region 3: link
-          (e2[1], e1[left - 1], *tau)
-        } else if i == left + 2 {
-          // Region 4: squaring
-          (e2[2], e2[1], e2[1])
-        } else {
-          // Region 5: second half chain
-          let k = i - left;
-          (e2[k], e2[1], e2[k - 1])
-        };
-
-        let residual = g1 - g2 * g3;
-
-        // Weight from E_pc tensor
-        let row = i / left_pc;
-        let col = i % left_pc;
-        let weight = w_right[row] * w_left[col];
-
-        weight * residual
-      })
-      .fold(F::ZERO, |acc, x| acc + x)
-  }
+  use crate::{
+    neutron::power_check_relation::{compute_pc_weighted_sum_bruteforce, pc_g_at},
+    provider::PallasEngine,
+    spartan::polys::univariate::UniPoly,
+  };
 
   /// Create a valid power table (all constraints = 0)
   fn create_valid_power_table<F: Field>(tau: &F, left: usize, right: usize) -> (Vec<F>, Vec<F>) {
@@ -518,15 +472,14 @@ mod tests {
     let (e1_1, e2_1) = create_valid_power_table(&tau_1, left, right);
     let (e1_2, e2_2) = create_valid_power_table(&tau_2, left, right);
 
-    // Create random E_pc weights
-    let w1_left: Vec<F> = (0..S_pc.left_pc).map(|i| F::from((i + 1) as u64)).collect();
-    let w1_right: Vec<F> = (0..S_pc.right_pc).map(|i| F::from((i + 10) as u64)).collect();
-    let w2_left: Vec<F> = (0..S_pc.left_pc).map(|i| F::from((i + 100) as u64)).collect();
-    let w2_right: Vec<F> = (0..S_pc.right_pc).map(|i| F::from((i + 200) as u64)).collect();
+    // Create random E weights (using MAIN domain dimensions)
+    let w1_left: Vec<F> = (0..left).map(|i| F::from((i + 1) as u64)).collect();
+    let w1_right: Vec<F> = (0..right).map(|i| F::from((i + 10) as u64)).collect();
+    let w2_left: Vec<F> = (0..left).map(|i| F::from((i + 100) as u64)).collect();
+    let w2_right: Vec<F> = (0..right).map(|i| F::from((i + 200) as u64)).collect();
 
     // Compute pc_sumcheck_claim for running instance (brute force)
-    let pc_claim_1 =
-      compute_pc_weighted_sum_bruteforce(&e1_1, &e2_1, &tau_1, &w1_left, &w1_right, S_pc.left_pc);
+    let pc_claim_1 = compute_pc_weighted_sum_bruteforce(&e1_1, &e2_1, &tau_1, &w1_left, &w1_right);
 
     // For a VALID power table, pc_sumcheck_claim should be 0
     assert_eq!(pc_claim_1, F::ZERO, "Valid power table should have pc_sumcheck_claim = 0");
@@ -535,14 +488,8 @@ mod tests {
     let mut e1_corrupted = e1_1.clone();
     e1_corrupted[2] = F::from(999u64); // Corrupt one entry
 
-    let pc_claim_corrupted = compute_pc_weighted_sum_bruteforce(
-      &e1_corrupted,
-      &e2_1,
-      &tau_1,
-      &w1_left,
-      &w1_right,
-      S_pc.left_pc,
-    );
+    let pc_claim_corrupted =
+      compute_pc_weighted_sum_bruteforce(&e1_corrupted, &e2_1, &tau_1, &w1_left, &w1_right);
     assert_ne!(
       pc_claim_corrupted,
       F::ZERO,
@@ -604,17 +551,15 @@ mod tests {
     // Fresh instance with valid table (pc_sumcheck_claim = 0)
     let (e1_2, e2_2) = create_valid_power_table(&tau_2, left, right);
 
-    // E_pc weights
-    let w1_left: Vec<F> = (0..S_pc.left_pc).map(|i| F::from((i + 1) as u64)).collect();
-    let w1_right: Vec<F> = (0..S_pc.right_pc).map(|i| F::from((i + 10) as u64)).collect();
-    let w2_left: Vec<F> = (0..S_pc.left_pc).map(|i| F::from((i + 100) as u64)).collect();
-    let w2_right: Vec<F> = (0..S_pc.right_pc).map(|i| F::from((i + 200) as u64)).collect();
+    // E weights (using MAIN domain dimensions)
+    let w1_left: Vec<F> = (0..left).map(|i| F::from((i + 1) as u64)).collect();
+    let w1_right: Vec<F> = (0..right).map(|i| F::from((i + 10) as u64)).collect();
+    let w2_left: Vec<F> = (0..left).map(|i| F::from((i + 100) as u64)).collect();
+    let w2_right: Vec<F> = (0..right).map(|i| F::from((i + 200) as u64)).collect();
 
     // Compute individual pc_sumcheck_claim values
-    let pc_claim_1 =
-      compute_pc_weighted_sum_bruteforce(&e1_1, &e2_1, &tau_1, &w1_left, &w1_right, S_pc.left_pc);
-    let pc_claim_2 =
-      compute_pc_weighted_sum_bruteforce(&e1_2, &e2_2, &tau_2, &w2_left, &w2_right, S_pc.left_pc);
+    let pc_claim_1 = compute_pc_weighted_sum_bruteforce(&e1_1, &e2_1, &tau_1, &w1_left, &w1_right);
+    let pc_claim_2 = compute_pc_weighted_sum_bruteforce(&e1_2, &e2_2, &tau_2, &w2_left, &w2_right);
 
     assert_ne!(
       pc_claim_1,
@@ -663,6 +608,7 @@ mod tests {
   /// This interpolates ALL inputs (weights, witness, τ) at point t and computes:
   /// Σᵢ w_left(t)[col] × w_right(t)[row] × (g1(t)[i] - g2(t)[i]·g3(t)[i])
   ///
+  /// Uses main domain dimensions (left, right) for weights.
   /// This is the RAW contribution BEFORE ρ-scaling.
   fn compute_pc_at_point_raw<F: Field>(
     t: &F,
@@ -677,7 +623,7 @@ mod tests {
     tau_1: &F,
     tau_2: &F,
     left: usize,
-    left_pc: usize,
+    right: usize,
     num_cons: usize,
   ) -> F {
     // Linear interpolation helper: a + t·(b - a)
@@ -702,33 +648,21 @@ mod tests {
     // Interpolate τ at t
     let tau = interp(tau_1, tau_2);
 
-    // Sum over all constraints
-    (0..num_cons)
-      .map(|i| {
-        // Compute (g1, g2, g3) based on region (same as in prove_helper_pc)
-        let (g1, g2, g3) = if i == 0 {
-          (e_first[0], F::ONE, F::ONE)
-        } else if i < left {
-          (e_first[i], e_first[i - 1], tau)
-        } else if i == left {
-          (e_second[0], F::ONE, F::ONE)
-        } else if i == left + 1 && e_second.len() > 1 {
-          (e_second[1], e_first[left - 1], tau)
-        } else if i == left + 2 && e_second.len() > 2 {
-          (e_second[2], e_second[1], e_second[1])
-        } else {
-          let k = i - left;
-          (e_second[k], e_second[1], e_second[k - 1])
-        };
-
+    // Sum over main domain (left × right), skip padding indices >= num_cons
+    let mut sum = F::ZERO;
+    for row in 0..right {
+      for col in 0..left {
+        let i = row * left + col;
+        if i >= num_cons {
+          continue; // Skip padding
+        }
+        // Use canonical pc_g_at from power_check_relation
+        let (g1, g2, g3) = pc_g_at(i, left, &e_first, &e_second, tau);
         let residual = g1 - g2 * g3;
-
-        // Weight from tensor product
-        let row = i / left_pc;
-        let col = i % left_pc;
-        w_left[col] * w_right[row] * residual
-      })
-      .fold(F::ZERO, |acc, x| acc + x)
+        sum += w_left[col] * w_right[row] * residual;
+      }
+    }
+    sum
   }
 
   /// Test that prove_helper_pc evaluations at {0, 2, 3, 4, 5} match brute-force.
@@ -754,11 +688,12 @@ mod tests {
     // Fresh instance: valid table
     let (e1_2, e2_2) = create_valid_power_table(&tau_2, left, right);
 
-    // E_pc weights - use varied values to ensure tensor structure matters
-    let w1_left: Vec<F> = (0..S_pc.left_pc).map(|i| F::from((i * 3 + 1) as u64)).collect();
-    let w1_right: Vec<F> = (0..S_pc.right_pc).map(|i| F::from((i * 5 + 2) as u64)).collect();
-    let w2_left: Vec<F> = (0..S_pc.left_pc).map(|i| F::from((i * 7 + 3) as u64)).collect();
-    let w2_right: Vec<F> = (0..S_pc.right_pc).map(|i| F::from((i * 11 + 4) as u64)).collect();
+    // E weights - use varied values to ensure tensor structure matters
+    // Now using main domain dimensions (left × right) instead of separate PC dimensions
+    let w1_left: Vec<F> = (0..left).map(|i| F::from((i * 3 + 1) as u64)).collect();
+    let w1_right: Vec<F> = (0..right).map(|i| F::from((i * 5 + 2) as u64)).collect();
+    let w2_left: Vec<F> = (0..left).map(|i| F::from((i * 7 + 3) as u64)).collect();
+    let w2_right: Vec<F> = (0..right).map(|i| F::from((i * 11 + 4) as u64)).collect();
 
     let rho = F::from(42u64);
 
@@ -795,7 +730,7 @@ mod tests {
       &tau_1,
       &tau_2,
       left,
-      S_pc.left_pc,
+      right,
       S_pc.num_cons,
     );
 
@@ -812,7 +747,7 @@ mod tests {
       &tau_1,
       &tau_2,
       left,
-      S_pc.left_pc,
+      right,
       S_pc.num_cons,
     );
 
@@ -829,7 +764,7 @@ mod tests {
       &tau_1,
       &tau_2,
       left,
-      S_pc.left_pc,
+      right,
       S_pc.num_cons,
     );
 
@@ -846,7 +781,7 @@ mod tests {
       &tau_1,
       &tau_2,
       left,
-      S_pc.left_pc,
+      right,
       S_pc.num_cons,
     );
 
@@ -863,7 +798,7 @@ mod tests {
       &tau_1,
       &tau_2,
       left,
-      S_pc.left_pc,
+      right,
       S_pc.num_cons,
     );
 
@@ -895,21 +830,8 @@ mod tests {
     // Verify all constraints = 0 for valid power table
     let num_cons = left + right;
     for i in 0..num_cons {
-      let (g1, g2, g3) = if i == 0 {
-        (e1[0], F::ONE, F::ONE)
-      } else if i < left {
-        (e1[i], e1[i - 1], tau)
-      } else if i == left {
-        (e2[0], F::ONE, F::ONE)
-      } else if i == left + 1 {
-        (e2[1], e1[left - 1], tau)
-      } else if i == left + 2 {
-        (e2[2], e2[1], e2[1])
-      } else {
-        let k = i - left;
-        (e2[k], e2[1], e2[k - 1])
-      };
-
+      // Use canonical pc_g_at from power_check_relation
+      let (g1, g2, g3) = pc_g_at(i, left, &e1, &e2, tau);
       let residual = g1 - g2 * g3;
       assert_eq!(
         residual,

@@ -9,50 +9,43 @@ use serde::{Deserialize, Serialize};
 
 /// Metadata for PowerCheck relation (Construction 2).
 /// Verifies e = [e₁ || e₂] contains valid powers of τ via F_PC(g₁,g₂,g₃) = g₁ - g₂·g₃ = 0
+///
+/// # Sumcheck Domain
+///
+/// The PowerCheck sumcheck uses the SAME domain as the main NSC sumcheck (left × right).
+/// This allows using a single weight table E for both sumchecks, which is essential for
+/// soundness: E is checked via ZC_PC, and using the same E for NSC_PC ensures the
+/// PowerCheck constraints are properly weighted.
+///
+/// The actual number of PowerCheck constraints is only `left + right`, so indices
+/// `i >= num_cons` are skipped in `prove_helper_pc` (they contribute zero).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PowerCheckStructure {
   /// Length of e₁. When ℓ is odd, left > right.
   /// Example: ℓ=11 → left=64, right=32
   pub left: usize,
 
-  /// Length of e₂. Invariant: left × right = N (padded constraint count).
+  /// Length of e₂. Invariant: left × right = N (main relation constraint count).
   /// Example: ℓ=10 → left=32, right=32 (even case)
   pub right: usize,
 
-  /// Number of PC constraints = left + right
+  /// Actual number of PowerCheck constraints = left + right.
+  /// NOT necessarily a power of two (e.g., 96 for ℓ=11).
+  /// Indices >= num_cons are padding and skipped in prove_helper_pc.
   pub num_cons: usize,
-
-  /// E_pc tensor split for left half. When ⌈log₂(num_cons)⌉ is odd, left_pc > right_pc.
-  pub left_pc: usize,
-
-  /// E_pc tensor split for right half. Invariant: left_pc × right_pc ≥ num_cons.
-  pub right_pc: usize,
 }
 
 impl PowerCheckStructure {
-  /// Create a new PowerCheckStructure from split dimensions
+  /// Create a new PowerCheckStructure from split dimensions.
+  ///
+  /// For odd ℓ, left > right (e.g., ℓ=11 → left=64, right=32 → num_cons=96).
+  /// The sumcheck uses the main domain (left × right), with indices >= num_cons skipped.
   pub fn new(left: usize, right: usize) -> Self {
     let num_cons = left + right;
-
-    // Assert domain size is power of two (paper's intended setting with ℓ even)
-    assert!(
-      num_cons.is_power_of_two(),
-      "PC domain size must be power of two; got {} (left={}, right={})",
-      num_cons,
-      left,
-      right
-    );
-
-    let ell_pc = num_cons.trailing_zeros() as usize;
-    let left_pc = 1 << ell_pc.div_ceil(2);
-    let right_pc = 1 << (ell_pc / 2);
-
     Self {
       left,
       right,
       num_cons,
-      left_pc,
-      right_pc,
     }
   }
 
@@ -112,6 +105,22 @@ pub struct FoldedPowerCheckWitness<E: Engine> {
 }
 
 impl<E: Engine> FoldedPowerCheckInstance<E> {
+  /// Create a fresh NSC_PC instance from a ZC_PC instance.
+  ///
+  /// This converts a PowerCheck instance into the folded form for the NSC_PC sumcheck.
+  /// The `comm_E` parameter MUST be the same commitment used for the main NSC sumcheck,
+  /// ensuring both sumchecks use the same (checked) weight table.
+  ///
+  /// Fresh instances have pc_sumcheck_claim = 0 since the PowerCheck is exactly satisfied.
+  pub fn from_fresh_zc_pc(zc_pc: &PowerCheckInstance<E>, comm_E: Commitment<E>) -> Self {
+    Self {
+      pc_sumcheck_claim: E::Scalar::ZERO,
+      comm_witness: zc_pc.comm_powers,
+      comm_weights: comm_E,
+      tau: zc_pc.tau,
+    }
+  }
+
   /// Create an instance from a witness with proper commitments
   pub fn from_witness(
     ck: &CommitmentKey<E>,
@@ -159,8 +168,9 @@ impl<E: Engine> FoldedPowerCheckInstance<E> {
 impl<E: Engine> FoldedPowerCheckWitness<E> {
   /// Create a default witness for tau=0
   ///
-  /// Note: witness has dimensions (left, right) matching the power table,
-  /// but weights has dimensions (left_pc, right_pc) for the sumcheck structure.
+  /// Both witness and weights have dimensions (left, right) matching the main domain.
+  /// Using the same dimensions allows sharing a single weight table E for both
+  /// the main NSC sumcheck and the NSC_PC sumcheck.
   ///
   /// The witness is a valid power table for tau=0: [1, 0, 0, ...] || [1, 0, 0, ...]
   /// This satisfies all PowerCheck constraints since e[i] = e[i-1]·τ = e[i-1]·0 = 0.
@@ -172,12 +182,24 @@ impl<E: Engine> FoldedPowerCheckWitness<E> {
 
     Self {
       witness: WeightTable::new(witness_vec, E::Scalar::ZERO, S.left),
-      // weights: sumcheck weights, dimensions (left_pc, right_pc)
+      // weights: same dimensions as main E (left, right), NOT (left_pc, right_pc)
       weights: WeightTable::new(
-        vec![E::Scalar::ZERO; S.left_pc + S.right_pc],
+        vec![E::Scalar::ZERO; S.left + S.right],
         E::Scalar::ZERO,
-        S.left_pc,
+        S.left,
       ),
+    }
+  }
+
+  /// Create a fresh NSC_PC witness from a ZC_PC witness.
+  ///
+  /// This converts a PowerCheck witness into the folded form for the NSC_PC sumcheck.
+  /// The `E` parameter MUST be the same weight table used for the main NSC sumcheck,
+  /// ensuring both sumchecks use the same (checked) weight table.
+  pub fn from_fresh_zc_pc(zc_pc: &PowerCheckWitness<E>, E: WeightTable<E>) -> Self {
+    Self {
+      witness: zc_pc.powers.clone(),
+      weights: E,
     }
   }
 
@@ -278,6 +300,41 @@ pub fn pc_residual_at<F: Field>(i: usize, left: usize, e1: &[F], e2: &[F], tau: 
   g1 - g2 * g3
 }
 
+/// Brute-force computation of PowerCheck weighted sum for testing.
+/// Computes: pc_sumcheck_claim = Σᵢ w_right[row] · w_left[col] · (g₁[i] - g₂[i]·g₃[i])
+///
+/// Uses main domain dimensions (left, right) for weights, matching the main NSC sumcheck.
+/// Indices >= num_cons are skipped (they contribute zero since F_PC = 0 for padding).
+///
+/// This is a test utility that can be imported by other test modules.
+#[cfg(test)]
+pub(crate) fn compute_pc_weighted_sum_bruteforce<F: Field>(
+  e1: &[F],      // First half of power table (length = left)
+  e2: &[F],      // Second half of power table (length = right)
+  tau: &F,
+  w_left: &[F],  // E left weights (length = left, same as main E)
+  w_right: &[F], // E right weights (length = right, same as main E)
+) -> F {
+  let left = e1.len();
+  let right = e2.len();
+  let num_cons = left + right;
+
+  // Iterate over main domain (left × right), skip padding (i >= num_cons)
+  let mut sum = F::ZERO;
+  for row in 0..right {
+    for col in 0..left {
+      let i = row * left + col;
+      if i >= num_cons {
+        continue; // Skip padding
+      }
+      let (g1, g2, g3) = pc_g_at(i, left, e1, e2, *tau);
+      let residual = g1 - g2 * g3;
+      sum += w_right[row] * w_left[col] * residual;
+    }
+  }
+  sum
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -301,42 +358,31 @@ mod tests {
     (WeightTable::new(vec, r, left), tau)
   }
 
-  /// Create random weights [E_pc,1 || E_pc,2] for testing.
-  fn random_weights(rng: &mut impl RngCore, left_pc: usize, right_pc: usize) -> WeightTable<E> {
-    let vec: Vec<_> = (0..(left_pc + right_pc))
+  /// Create random weights with main domain dimensions (left, right).
+  /// This matches the dimensions of the main E weight table.
+  fn random_weights(rng: &mut impl RngCore, left: usize, right: usize) -> WeightTable<E> {
+    let vec: Vec<_> = (0..(left + right))
       .map(|_| <E as Engine>::Scalar::random(&mut *rng))
       .collect();
     let r = <E as Engine>::Scalar::random(&mut *rng);
-    WeightTable::new(vec, r, left_pc)
+    WeightTable::new(vec, r, left)
   }
 
-  /// Compute pc_sumcheck_claim = Σᵢ E_pc,2[row(i)] · E_pc,1[col(i)] · (g₁[i] - g₂[i]·g₃[i])
-  ///
-  /// where:
-  ///   - i ∈ [0, num_cons) where num_cons = left + right
-  ///   - row(i) = i / left_pc
-  ///   - col(i) = i % left_pc
+  /// Compute pc_sumcheck_claim using WeightTable inputs.
+  /// Delegates to the shared `compute_pc_weighted_sum_bruteforce` function.
   fn compute_power_check_sumcheck_claim_naive(
-    S_pc: &PowerCheckStructure,
+    _S_pc: &PowerCheckStructure,
     weights: &WeightTable<E>,
     table: &WeightTable<E>,
     tau: <E as Engine>::Scalar,
   ) -> <E as Engine>::Scalar {
-    let e1 = table.e1();
-    let e2 = table.e2();
-    let left = table.left();
-
-    let weights_e1 = weights.e1(); // E_pc,1
-    let weights_e2 = weights.e2(); // E_pc,2
-
-    (0..S_pc.num_cons)
-      .map(|i| {
-        let residual = pc_residual_at(i, left, e1, e2, tau);
-        let row = i / S_pc.left_pc;
-        let col = i % S_pc.left_pc;
-        weights_e2[row] * weights_e1[col] * residual
-      })
-      .fold(<E as Engine>::Scalar::ZERO, |acc, x| acc + x)
+    compute_pc_weighted_sum_bruteforce(
+      table.e1(),
+      table.e2(),
+      &tau,
+      weights.e1(),
+      weights.e2(),
+    )
   }
 
   // ============================================================================
@@ -447,7 +493,8 @@ mod tests {
     let S_pc = PowerCheckStructure::new(left, right);
 
     let (table, tau) = fresh_power_table(&mut rng, left, right);
-    let weights = random_weights(&mut rng, S_pc.left_pc, S_pc.right_pc);
+    // Use main domain dimensions (left, right) for weights
+    let weights = random_weights(&mut rng, left, right);
 
     let pc_claim = compute_power_check_sumcheck_claim_naive(&S_pc, &weights, &table, tau);
 
@@ -473,9 +520,9 @@ mod tests {
     let (table1, tau1) = fresh_power_table(&mut rng, left, right);
     let (table2, tau2) = fresh_power_table(&mut rng, left, right);
 
-    // Create two weight tables
-    let weights1 = random_weights(&mut rng, S_pc.left_pc, S_pc.right_pc);
-    let weights2 = random_weights(&mut rng, S_pc.left_pc, S_pc.right_pc);
+    // Create two weight tables with main domain dimensions
+    let weights1 = random_weights(&mut rng, left, right);
+    let weights2 = random_weights(&mut rng, left, right);
 
     // Pick a random folding challenge
     let r_b = <E as Engine>::Scalar::random(&mut rng);
