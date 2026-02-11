@@ -78,8 +78,8 @@ pub struct PowerCheckWitness<E: Engine> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct FoldedPowerCheckInstance<E: Engine> {
-  /// Accumulated error. Fresh: T_pc = 0.
-  pub T_pc: E::Scalar,
+  /// Accumulated error. Fresh: pc_sumcheck_claim = 0.
+  pub pc_sumcheck_claim: E::Scalar,
 
   /// Commitment to accumulated PowerCheck witness (powers of original tau)
   pub comm_witness: Commitment<E>,
@@ -109,7 +109,7 @@ impl<E: Engine> FoldedPowerCheckInstance<E> {
     // Suppress unused warning - S is kept for API consistency
     let _ = S;
     Self {
-      T_pc: E::Scalar::ZERO,
+      pc_sumcheck_claim: E::Scalar::ZERO,
       comm_witness: Commitment::<E>::default(),
       comm_weights: Commitment::<E>::default(),
       tau: E::Scalar::ZERO,
@@ -122,12 +122,12 @@ impl<E: Engine> FoldedPowerCheckInstance<E> {
     u2: &PowerCheckInstance<E>,
     r_b: &E::Scalar,
     comm_weights_new: &Commitment<E>,
-    T_pc_out: &E::Scalar,
+    pc_sumcheck_claim_out: &E::Scalar,
   ) -> Self {
     let one_minus_r = E::Scalar::ONE - r_b;
 
     Self {
-      T_pc: *T_pc_out,
+      pc_sumcheck_claim: *pc_sumcheck_claim_out,
       comm_witness: self.comm_witness * one_minus_r + u2.comm_powers * *r_b,
       comm_weights: self.comm_weights * one_minus_r + *comm_weights_new * *r_b,
       tau: one_minus_r * self.tau + *r_b * u2.tau,
@@ -178,7 +178,7 @@ impl<E: Engine> AbsorbInRO2Trait<E> for PowerCheckInstance<E> {
 
 impl<E: Engine> AbsorbInRO2Trait<E> for FoldedPowerCheckInstance<E> {
   fn absorb_in_ro2(&self, ro: &mut E::RO2) {
-    ro.absorb(self.T_pc);
+    ro.absorb(self.pc_sumcheck_claim);
     self.comm_witness.absorb_in_ro2(ro);
     self.comm_weights.absorb_in_ro2(ro);
     ro.absorb(self.tau);
@@ -278,13 +278,13 @@ mod tests {
     WeightTable::new(vec, r, left_pc)
   }
 
-  /// Compute T_pc = Σᵢ E_pc,2[row(i)] · E_pc,1[col(i)] · (g₁[i] - g₂[i]·g₃[i])
+  /// Compute pc_sumcheck_claim = Σᵢ E_pc,2[row(i)] · E_pc,1[col(i)] · (g₁[i] - g₂[i]·g₃[i])
   ///
   /// where:
   ///   - i ∈ [0, num_cons) where num_cons = left + right
   ///   - row(i) = i / left_pc
   ///   - col(i) = i % left_pc
-  fn compute_t_pc_naive(
+  fn compute_power_check_sumcheck_claim_naive(
     S_pc: &PowerCheckStructure,
     weights: &WeightTable<E>,
     table: &WeightTable<E>,
@@ -417,20 +417,20 @@ mod tests {
     let (table, tau) = fresh_power_table(&mut rng, left, right);
     let weights = random_weights(&mut rng, S_pc.left_pc, S_pc.right_pc);
 
-    let t_pc = compute_t_pc_naive(&S_pc, &weights, &table, tau);
+    let pc_claim = compute_power_check_sumcheck_claim_naive(&S_pc, &weights, &table, tau);
 
     assert_eq!(
-      t_pc,
+      pc_claim,
       <E as Engine>::Scalar::ZERO,
       "Weighted sum should be zero for valid table"
     );
   }
 
   // ============================================================================
-  // Test 5: Folding closure - after folding, T_pc computed naively matches
+  // Test 5: Folding closure - after folding, pc_sumcheck_claim computed naively matches
   // ============================================================================
   #[test]
-  fn test_nsc_pc_closed_under_folding_when_tpc_is_correct() {
+  fn test_nsc_pc_closed_under_folding_when_pc_claim_is_correct() {
     let mut rng = StdRng::seed_from_u64(999);
 
     let left = 64;
@@ -448,39 +448,47 @@ mod tests {
     // Pick a random folding challenge
     let r_b = <E as Engine>::Scalar::random(&mut rng);
 
+    // Verify that fresh tables have pc_sumcheck_claim = 0
+    let pc_claim_1 = compute_power_check_sumcheck_claim_naive(&S_pc, &weights1, &table1, tau1);
+    let pc_claim_2 = compute_power_check_sumcheck_claim_naive(&S_pc, &weights2, &table2, tau2);
+
+    assert_eq!(
+      pc_claim_1,
+      <E as Engine>::Scalar::ZERO,
+      "Fresh table 1 should have pc_sumcheck_claim = 0"
+    );
+    assert_eq!(
+      pc_claim_2,
+      <E as Engine>::Scalar::ZERO,
+      "Fresh table 2 should have pc_sumcheck_claim = 0"
+    );
+
     // Fold everything
-    let table_f = table1.fold(&table2, &r_b);
-    let weights_f = weights1.fold(&weights2, &r_b);
-    let tau_f = (<E as Engine>::Scalar::ONE - r_b) * tau1 + r_b * tau2;
+    let folded_table = table1.fold(&table2, &r_b);
+    let folded_weights = weights1.fold(&weights2, &r_b);
+    let folded_tau = (<E as Engine>::Scalar::ONE - r_b) * tau1 + r_b * tau2;
 
-    // Compute T_pc for the folded instance
-    let tpc_f = compute_t_pc_naive(&S_pc, &weights_f, &table_f, tau_f);
+    // Compute pc_sumcheck_claim for the folded instance
+    let folded_pc_claim = compute_power_check_sumcheck_claim_naive(&S_pc, &folded_weights, &folded_table, folded_tau);
 
-    // Verify that this T_pc is the correct "error" for the folded relation.
-    // The folded relation is satisfied when T_pc equals the weighted sum of residuals.
-    // Since we computed tpc_f exactly as that sum, this is a tautology for correctness,
-    // but it verifies that compute_t_pc_naive works correctly on folded instances.
-
-    // Also verify that the two fresh tables had T_pc = 0
-    let tpc1 = compute_t_pc_naive(&S_pc, &weights1, &table1, tau1);
-    let tpc2 = compute_t_pc_naive(&S_pc, &weights2, &table2, tau2);
-
-    assert_eq!(
-      tpc1,
+    // A. Folding two DIFFERENT valid tables produces non-zero pc_sumcheck_claim (cross-terms exist)
+    assert_ne!(
+      folded_pc_claim,
       <E as Engine>::Scalar::ZERO,
-      "Fresh table 1 should have T_pc = 0"
-    );
-    assert_eq!(
-      tpc2,
-      <E as Engine>::Scalar::ZERO,
-      "Fresh table 2 should have T_pc = 0"
+      "Folding different valid tables should produce non-zero pc_sumcheck_claim due to cross-terms"
     );
 
-    // The folded T_pc is generally nonzero due to cross-terms.
-    // We just verify the computation completed without error.
-    // The important check is that if we later verify the folded instance
-    // with T_pc = tpc_f, it should pass.
-    let _ = tpc_f; // Use the value to avoid warning
+    // B. Folding a table with ITSELF should preserve pc_sumcheck_claim = 0 (no cross-terms)
+    let self_folded_table = table1.fold(&table1, &r_b);
+    let self_folded_weights = weights1.fold(&weights1, &r_b);
+    let self_folded_tau = tau1; // (1-r_b)*tau1 + r_b*tau1 = tau1
+    let self_folded_pc_claim =
+      compute_power_check_sumcheck_claim_naive(&S_pc, &self_folded_weights, &self_folded_table, self_folded_tau);
+    assert_eq!(
+      self_folded_pc_claim,
+      <E as Engine>::Scalar::ZERO,
+      "Self-fold should preserve pc_sumcheck_claim = 0 (no cross-terms)"
+    );
   }
 
   // ============================================================================

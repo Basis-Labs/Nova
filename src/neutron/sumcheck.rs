@@ -409,7 +409,7 @@ mod tests {
   use crate::{provider::PallasEngine, spartan::polys::univariate::UniPoly};
 
   /// Brute-force computation of PowerCheck weighted sum for testing.
-  /// Computes: T_pc = Σᵢ E_pc_weight(i) · (g₁[i] - g₂[i]·g₃[i])
+  /// Computes: pc_sumcheck_claim = Σᵢ E_pc_weight(i) · (g₁[i] - g₂[i]·g₃[i])
   fn compute_pc_weighted_sum_bruteforce<F: Field>(
     e1: &[F],      // First half of power table
     e2: &[F],      // Second half of power table
@@ -507,18 +507,18 @@ mod tests {
     let w2_left: Vec<F> = (0..S_pc.left_pc).map(|i| F::from((i + 100) as u64)).collect();
     let w2_right: Vec<F> = (0..S_pc.right_pc).map(|i| F::from((i + 200) as u64)).collect();
 
-    // Compute T_pc for running instance (brute force)
-    let T_pc_1 =
+    // Compute pc_sumcheck_claim for running instance (brute force)
+    let pc_claim_1 =
       compute_pc_weighted_sum_bruteforce(&e1_1, &e2_1, &tau_1, &w1_left, &w1_right, S_pc.left_pc);
 
-    // For a VALID power table, T_pc should be 0
-    assert_eq!(T_pc_1, F::ZERO, "Valid power table should have T_pc = 0");
+    // For a VALID power table, pc_sumcheck_claim should be 0
+    assert_eq!(pc_claim_1, F::ZERO, "Valid power table should have pc_sumcheck_claim = 0");
 
     // Now test with an INVALID power table (corrupt one element)
     let mut e1_corrupted = e1_1.clone();
     e1_corrupted[2] = F::from(999u64); // Corrupt one entry
 
-    let T_pc_corrupted = compute_pc_weighted_sum_bruteforce(
+    let pc_claim_corrupted = compute_pc_weighted_sum_bruteforce(
       &e1_corrupted,
       &e2_1,
       &tau_1,
@@ -527,9 +527,9 @@ mod tests {
       S_pc.left_pc,
     );
     assert_ne!(
-      T_pc_corrupted,
+      pc_claim_corrupted,
       F::ZERO,
-      "Corrupted power table should have T_pc ≠ 0"
+      "Corrupted power table should have pc_sumcheck_claim ≠ 0"
     );
 
     // Test prove_helper_pc with random rho
@@ -572,7 +572,7 @@ mod tests {
     type E = PallasEngine;
     type F = <E as Engine>::Scalar;
 
-    // Test case with non-zero T_pc (using corrupted tables)
+    // Test case with non-zero pc_sumcheck_claim (using corrupted tables)
     let left = 4usize;
     let right = 4usize;
     let S_pc = PowerCheckStructure::new(left, right);
@@ -580,11 +580,11 @@ mod tests {
     let tau_1 = F::from(7u64);
     let tau_2 = F::from(11u64);
 
-    // Create tables - running instance with corrupted table (non-zero T_pc)
+    // Create tables - running instance with corrupted table (non-zero pc_sumcheck_claim)
     let (mut e1_1, e2_1) = create_valid_power_table(&tau_1, left, right);
-    e1_1[2] = F::from(999u64); // Corrupt to get non-zero T_pc
+    e1_1[2] = F::from(999u64); // Corrupt to get non-zero pc_sumcheck_claim
 
-    // Fresh instance with valid table (T_pc = 0)
+    // Fresh instance with valid table (pc_sumcheck_claim = 0)
     let (e1_2, e2_2) = create_valid_power_table(&tau_2, left, right);
 
     // E_pc weights
@@ -593,28 +593,28 @@ mod tests {
     let w2_left: Vec<F> = (0..S_pc.left_pc).map(|i| F::from((i + 100) as u64)).collect();
     let w2_right: Vec<F> = (0..S_pc.right_pc).map(|i| F::from((i + 200) as u64)).collect();
 
-    // Compute individual T_pc values
-    let T_pc_1 =
+    // Compute individual pc_sumcheck_claim values
+    let pc_claim_1 =
       compute_pc_weighted_sum_bruteforce(&e1_1, &e2_1, &tau_1, &w1_left, &w1_right, S_pc.left_pc);
-    let T_pc_2 =
+    let pc_claim_2 =
       compute_pc_weighted_sum_bruteforce(&e1_2, &e2_2, &tau_2, &w2_left, &w2_right, S_pc.left_pc);
 
     assert_ne!(
-      T_pc_1,
+      pc_claim_1,
       F::ZERO,
-      "Running instance should have non-zero T_pc"
+      "Running instance should have non-zero pc_sumcheck_claim"
     );
     assert_eq!(
-      T_pc_2,
+      pc_claim_2,
       F::ZERO,
-      "Fresh valid instance should have T_pc = 0"
+      "Fresh valid instance should have pc_sumcheck_claim = 0"
     );
 
     // Sample random rho
     let rho = F::from(42u64);
 
     // Compute expected claim as RLC
-    let T_claim_expected = (F::ONE - rho) * T_pc_1 + rho * T_pc_2;
+    let T_claim_expected = (F::ONE - rho) * pc_claim_1 + rho * pc_claim_2;
 
     // Run prove_helper_pc
     let (e0, e2, e3, e4, e5) = prove_helper_pc::<E>(

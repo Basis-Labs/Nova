@@ -103,7 +103,7 @@ pub fn convert_to_nsc<E: Engine>(
   //   - witness: the original power table being checked (from pc_wit)
   //   - weights: E_pc with dimensions (left_pc, right_pc) for sumcheck
   let nsc_pc_instance = FoldedPowerCheckInstance {
-    T_pc: E::Scalar::ZERO,
+    pc_sumcheck_claim: E::Scalar::ZERO,
     comm_witness: pc_inst.comm_powers,
     comm_weights: E_pc.commit(ck),
     tau: pc_inst.tau,

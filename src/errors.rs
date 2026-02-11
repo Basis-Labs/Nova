@@ -80,6 +80,9 @@ pub enum NovaError {
   /// returned when insecure setup is attempted in production builds
   #[error("SetupError: {0}")]
   SetupError(String),
+  /// returned when a field element inversion fails (division by zero)
+  #[error("DivideByZero")]
+  DivideByZero,
 }
 
 impl From<SynthesisError> for NovaError {

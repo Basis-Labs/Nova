@@ -18,6 +18,7 @@ use crate::{
   Commitment, CommitmentKey,
 };
 use ff::Field;
+use rand::Rng;
 use rand_core::OsRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -88,11 +89,11 @@ pub struct NIFSCombinedOutput<E: Engine> {
   /// r_b (folding challenge)
   pub r_b: E::Scalar,
   /// Fresh NSC instance before folding
-  pub nsc_fresh: (FoldedInstance<E>, FoldedWitness<E>),
+  pub nsc: (FoldedInstance<E>, FoldedWitness<E>),
   /// (Az, Bz, Cz) for fresh R1CS
-  pub abc_fresh: (Vec<E::Scalar>, Vec<E::Scalar>, Vec<E::Scalar>),
+  pub abc: (Vec<E::Scalar>, Vec<E::Scalar>, Vec<E::Scalar>),
   /// Fresh NSC_PC before folding
-  pub nsc_pc_fresh: (FoldedPowerCheckInstance<E>, FoldedPowerCheckWitness<E>),
+  pub nsc_pc: (FoldedPowerCheckInstance<E>, FoldedPowerCheckWitness<E>),
 }
 
 /// Construction 4: Fold both NSC and NSC_PC together
@@ -116,7 +117,7 @@ pub fn fold<E: Engine>(
   // Challenges and outputs
   r_b: &E::Scalar,
   T_out: &E::Scalar,
-  T_pc_out: &E::Scalar,
+  pc_sumcheck_claim_out: &E::Scalar,
 ) -> FoldedState<E> {
   let one_minus_r = E::Scalar::ONE - r_b;
 
@@ -155,7 +156,7 @@ pub fn fold<E: Engine>(
 
   // ===== PowerCheck NSC_PC =====
   let pc_instance = FoldedPowerCheckInstance {
-    T_pc: *T_pc_out,
+    pc_sumcheck_claim: *pc_sumcheck_claim_out,
     comm_witness: pc_running.0.comm_witness * one_minus_r + pc_fresh.0.comm_witness * *r_b,
     comm_weights: pc_running.0.comm_weights * one_minus_r + pc_fresh.0.comm_weights * *r_b,
     tau: pc_running.0.tau + *r_b * (pc_fresh.0.tau - pc_running.0.tau),
@@ -189,7 +190,13 @@ pub fn fold<E: Engine>(
 ///
 /// Returns (instance, witness, (Az, Bz, Cz)) all initialized to zero.
 /// The zero witness satisfies the zero instance with T=0.
-pub fn setup_nsc<E: Engine>(S: &Structure<E>) -> (FoldedInstance<E>, FoldedWitness<E>, (Vec<E::Scalar>, Vec<E::Scalar>, Vec<E::Scalar>)) {
+pub fn setup_nsc<E: Engine>(
+  S: &Structure<E>,
+) -> (
+  FoldedInstance<E>,
+  FoldedWitness<E>,
+  (Vec<E::Scalar>, Vec<E::Scalar>, Vec<E::Scalar>),
+) {
   // All zeros: W=0, u=0, X=0, T=0, E=0
   let instance = FoldedInstance::default(S);
   let witness = FoldedWitness::default(S);
@@ -205,8 +212,10 @@ pub fn setup_nsc<E: Engine>(S: &Structure<E>) -> (FoldedInstance<E>, FoldedWitne
 
 /// Initialize NSC_PC relation with zero/default instances
 ///
-/// Returns (instance, witness) with T_pc=0, tau=0, and zero weight tables.
-pub fn setup_nsc_pc<E: Engine>(S_pc: &PowerCheckStructure) -> (FoldedPowerCheckInstance<E>, FoldedPowerCheckWitness<E>) {
+/// Returns (instance, witness) with pc_sumcheck_claim=0, tau=0, and zero weight tables.
+pub fn setup_nsc_pc<E: Engine>(
+  S_pc: &PowerCheckStructure,
+) -> (FoldedPowerCheckInstance<E>, FoldedPowerCheckWitness<E>) {
   let instance = FoldedPowerCheckInstance::default(S_pc);
   let witness = FoldedPowerCheckWitness::default(S_pc);
   (instance, witness)
@@ -216,14 +225,16 @@ pub fn setup_nsc_pc<E: Engine>(S_pc: &PowerCheckStructure) -> (FoldedPowerCheckI
 ///
 /// With tau=0, the power table is [1, 0, 0, ...] ∥ [1, 0, 0, ...]
 /// which satisfies all PowerCheck constraints since e[i] = e[i-1]·τ = e[i-1]·0 = 0.
-pub fn setup_zc_pc<E: Engine>(S_pc: &PowerCheckStructure) -> (PowerCheckInstance<E>, PowerCheckWitness<E>) {
+pub fn setup_zc_pc<E: Engine>(
+  S_pc: &PowerCheckStructure,
+) -> (PowerCheckInstance<E>, PowerCheckWitness<E>) {
   let left = S_pc.left;
   let right = S_pc.right;
 
   // tau=0, so e₁ = [1, 0, 0, ...] and e₂ = [1, 0, 0, ...]
   let mut powers_vec = vec![E::Scalar::ZERO; left + right];
-  powers_vec[0] = E::Scalar::ONE;     // e₁[0] = 1 (base case)
-  powers_vec[left] = E::Scalar::ONE;  // e₂[0] = 1 (base case)
+  powers_vec[0] = E::Scalar::ONE; // e₁[0] = 1 (base case)
+  powers_vec[left] = E::Scalar::ONE; // e₂[0] = 1 (base case)
 
   let powers = WeightTable::new(powers_vec, E::Scalar::ZERO, left);
 
@@ -333,7 +344,8 @@ impl<E: Engine> NIFS<E> {
 
     // compute the sum-check polynomial's evaluations at r_b
     let eq_rho_r_b = (E::Scalar::ONE - rho) * (E::Scalar::ONE - r_b) + rho * r_b;
-    let T_out = poly.evaluate(&r_b) * eq_rho_r_b.invert().unwrap(); // TODO: remove unwrap
+    let eq_rho_r_b_inv = eq_rho_r_b.invert().ok_or(NovaError::DivideByZero)?;
+    let T_out = poly.evaluate(&r_b) * eq_rho_r_b_inv;
 
     let U = U1.fold(U2, &comm_E, &r_b, &T_out)?;
     let W = W1.fold(W2, &E, &r_b)?;
@@ -388,7 +400,8 @@ impl<E: Engine> NIFS<E> {
 
     // compute the sum-check polynomial's evaluations at r_b
     let eq_rho_r_b = (E::Scalar::ONE - rho) * (E::Scalar::ONE - r_b) + rho * r_b;
-    let T_out = self.poly.evaluate(&r_b) * eq_rho_r_b.invert().unwrap(); // TODO: remove unwrap
+    let eq_rho_r_b_inv = eq_rho_r_b.invert().ok_or(NovaError::DivideByZero)?;
+    let T_out = self.poly.evaluate(&r_b) * eq_rho_r_b_inv;
 
     let U = U1.fold(U2, &self.comm_E, &r_b, &T_out)?;
 
@@ -450,8 +463,8 @@ impl<E: Engine> NIFS<E> {
     // === PHASE 4: Compute T claims ===
     // T_nsc = (1-ρ)·T_running + ρ·T_fresh where T_fresh = 0
     let T_nsc = (E::Scalar::ONE - rho) * nsc_running.0.T;
-    // T_pc = (1-ρ)·T_pc_running + ρ·T_pc_fresh where T_pc_fresh = 0
-    let T_nsc_pc = (E::Scalar::ONE - rho) * nsc_pc_running.0.T_pc;
+    // pc_sumcheck_claim = (1-ρ)·running + ρ·fresh where fresh = 0
+    let pc_sumcheck_claim = (E::Scalar::ONE - rho) * nsc_pc_running.0.pc_sumcheck_claim;
 
     // === PHASE 5: Compute (Az, Bz, Cz) for fresh R1CS ===
     let z_fresh = [
@@ -477,7 +490,7 @@ impl<E: Engine> NIFS<E> {
     // and E_pc (with dimensions left_pc, right_pc) becomes the weights
     let comm_E_pc = E_pc.commit(ck);
     let nsc_pc_fresh_instance = FoldedPowerCheckInstance {
-      T_pc: E::Scalar::ZERO, // Fresh has zero error
+      pc_sumcheck_claim: E::Scalar::ZERO, // Fresh has zero error
       comm_witness: zc_pc_fresh.0.comm_powers,
       comm_weights: comm_E_pc,
       tau: zc_pc_fresh.0.tau,
@@ -501,14 +514,7 @@ impl<E: Engine> NIFS<E> {
       &Cz_fresh,
     );
 
-    let evals_nsc = vec![
-      e0_nsc,
-      T_nsc - e0_nsc,
-      e2_nsc,
-      e3_nsc,
-      e4_nsc,
-      e5_nsc,
-    ];
+    let evals_nsc = vec![e0_nsc, T_nsc - e0_nsc, e2_nsc, e3_nsc, e4_nsc, e5_nsc];
     let poly_nsc = UniPoly::<E::Scalar>::from_evals(&evals_nsc);
 
     // === PHASE 9: Run NSC_PC sumcheck (prove_helper_pc) ===
@@ -516,21 +522,20 @@ impl<E: Engine> NIFS<E> {
       &rho,
       S_pc,
       (nsc_pc_running.1.weights.e1(), nsc_pc_running.1.weights.e2()),
-      (nsc_pc_fresh_witness.weights.e1(), nsc_pc_fresh_witness.weights.e2()),
+      (
+        nsc_pc_fresh_witness.weights.e1(),
+        nsc_pc_fresh_witness.weights.e2(),
+      ),
       (nsc_pc_running.1.witness.e1(), nsc_pc_running.1.witness.e2()),
-      (nsc_pc_fresh_witness.witness.e1(), nsc_pc_fresh_witness.witness.e2()),
+      (
+        nsc_pc_fresh_witness.witness.e1(),
+        nsc_pc_fresh_witness.witness.e2(),
+      ),
       &nsc_pc_running.0.tau,
       &nsc_pc_fresh_instance.tau,
     );
 
-    let evals_pc = vec![
-      e0_pc,
-      T_nsc_pc - e0_pc,
-      e2_pc,
-      e3_pc,
-      e4_pc,
-      e5_pc,
-    ];
+    let evals_pc = vec![e0_pc, pc_sumcheck_claim - e0_pc, e2_pc, e3_pc, e4_pc, e5_pc];
     let poly_pc = UniPoly::<E::Scalar>::from_evals(&evals_pc);
 
     // === PHASE 10: Absorb both polys, squeeze r_b ===
@@ -541,7 +546,7 @@ impl<E: Engine> NIFS<E> {
 
     // === PHASE 11: Compute T_out values ===
     let eq_rho_r_b = (E::Scalar::ONE - rho) * (E::Scalar::ONE - r_b) + rho * r_b;
-    let eq_rho_r_b_inv = eq_rho_r_b.invert().unwrap(); // TODO: handle error
+    let eq_rho_r_b_inv = eq_rho_r_b.invert().ok_or(NovaError::DivideByZero)?;
 
     let T_out_nsc = poly_nsc.evaluate(&r_b) * eq_rho_r_b_inv;
     let T_out_nsc_pc = poly_pc.evaluate(&r_b) * eq_rho_r_b_inv;
@@ -568,16 +573,22 @@ impl<E: Engine> NIFS<E> {
 
     // === PHASE 14: Return combined output ===
     Ok(NIFSCombinedOutput {
-      nifs: NIFS { comm_E, poly: poly_nsc },
-      nifs_pc: NIFSPowerCheck { comm_E_pc: comm_E, poly_pc },
+      nifs: NIFS {
+        comm_E,
+        poly: poly_nsc,
+      },
+      nifs_pc: NIFSPowerCheck {
+        comm_E_pc: comm_E,
+        poly_pc,
+      },
       folded,
       new_zc_pc: (new_zc_pc_instance, new_zc_pc_witness),
       tau,
       rho,
       r_b,
-      nsc_fresh: (nsc_fresh_instance, nsc_fresh_witness),
-      abc_fresh: (Az_fresh, Bz_fresh, Cz_fresh),
-      nsc_pc_fresh: (nsc_pc_fresh_instance, nsc_pc_fresh_witness),
+      nsc: (nsc_fresh_instance, nsc_fresh_witness),
+      abc: (Az_fresh, Bz_fresh, Cz_fresh),
+      nsc_pc: (nsc_pc_fresh_instance, nsc_pc_fresh_witness),
     })
   }
 }
@@ -637,14 +648,17 @@ mod tests {
 
     if sum != U.T {
       return Err(NovaError::UnSat {
-        reason: format!("NSC claim mismatch: computed {:?} != claimed {:?}", sum, U.T),
+        reason: format!(
+          "NSC claim mismatch: computed {:?} != claimed {:?}",
+          sum, U.T
+        ),
       });
     }
     Ok(())
   }
 
   /// Brute-force verify the NSC_PC sumcheck claim
-  /// T_pc = Σᵢ E_pc[i] · pc_residual_at(i) should equal U.T_pc
+  /// pc_sumcheck_claim = Σᵢ E_pc[i] · pc_residual_at(i) should equal U.pc_sumcheck_claim
   fn verify_nsc_pc_claim_bruteforce<E: Engine>(
     S_pc: &PowerCheckStructure,
     U: &FoldedPowerCheckInstance<E>,
@@ -658,7 +672,7 @@ mod tests {
     let left = S_pc.left;
     let left_pc = S_pc.left_pc;
 
-    // T_pc = Σᵢ weight(i) · residual(i)
+    // pc_sumcheck_claim = Σᵢ weight(i) · residual(i)
     let sum: E::Scalar = (0..S_pc.num_cons)
       .map(|i| {
         let residual = pc_residual_at(i, left, e1, e2, tau);
@@ -668,9 +682,12 @@ mod tests {
       })
       .fold(E::Scalar::ZERO, |acc, x| acc + x);
 
-    if sum != U.T_pc {
+    if sum != U.pc_sumcheck_claim {
       return Err(NovaError::UnSat {
-        reason: format!("NSC_PC claim mismatch: computed {:?} != claimed {:?}", sum, U.T_pc),
+        reason: format!(
+          "NSC_PC claim mismatch: computed {:?} != claimed {:?}",
+          sum, U.pc_sumcheck_claim
+        ),
       });
     }
     Ok(())
@@ -731,7 +748,10 @@ mod tests {
     let expected_u = running.0.u * one_minus_r + fresh.0.u * *r_b;
     if folded.nsc_instance.u != expected_u {
       return Err(NovaError::UnSat {
-        reason: format!("u folding mismatch: {:?} != {:?}", folded.nsc_instance.u, expected_u),
+        reason: format!(
+          "u folding mismatch: {:?} != {:?}",
+          folded.nsc_instance.u, expected_u
+        ),
       });
     }
 
@@ -761,13 +781,17 @@ mod tests {
     let expected_tau = running.0.tau * one_minus_r + fresh.0.tau * *r_b;
     if folded.pc_instance.tau != expected_tau {
       return Err(NovaError::UnSat {
-        reason: format!("tau folding mismatch: {:?} != {:?}", folded.pc_instance.tau, expected_tau),
+        reason: format!(
+          "tau folding mismatch: {:?} != {:?}",
+          folded.pc_instance.tau, expected_tau
+        ),
       });
     }
 
     // Check witness (power table) folding
     for (i, w_f) in folded.pc_witness.witness.as_slice().iter().enumerate() {
-      let expected = running.1.witness.as_slice()[i] * one_minus_r + fresh.1.witness.as_slice()[i] * *r_b;
+      let expected =
+        running.1.witness.as_slice()[i] * one_minus_r + fresh.1.witness.as_slice()[i] * *r_b;
       if *w_f != expected {
         return Err(NovaError::UnSat {
           reason: format!("PC witness folding mismatch at index {}", i),
@@ -777,7 +801,8 @@ mod tests {
 
     // Check weights folding (should equal folded E)
     for (i, w_f) in folded.pc_witness.weights.as_slice().iter().enumerate() {
-      let expected = running.1.weights.as_slice()[i] * one_minus_r + fresh.1.weights.as_slice()[i] * *r_b;
+      let expected =
+        running.1.weights.as_slice()[i] * one_minus_r + fresh.1.weights.as_slice()[i] * *r_b;
       if *w_f != expected {
         return Err(NovaError::UnSat {
           reason: format!("PC weights folding mismatch at index {}", i),
@@ -1052,14 +1077,22 @@ mod tests {
       .expect("Folded NSC should satisfy Structure::is_sat");
 
     // 2. Verify NSC claim via brute force
-    verify_nsc_claim_bruteforce::<E>(&str, &result.folded.nsc_instance, &result.folded.nsc_witness)
-      .expect("NSC claim should match brute force computation");
+    verify_nsc_claim_bruteforce::<E>(
+      &str,
+      &result.folded.nsc_instance,
+      &result.folded.nsc_witness,
+    )
+    .expect("NSC claim should match brute force computation");
 
     // 3. Verify NSC_PC claim via brute force
-    // Note: This only works when T_pc = 0 (initial fold from valid ZC_PC instances)
+    // Note: This only works when pc_sumcheck_claim = 0 (initial fold from valid ZC_PC instances)
     // For subsequent folds, the relationship is more complex due to eq(ρ, r_b) factor
-    verify_nsc_pc_claim_bruteforce::<E>(&S_pc, &result.folded.pc_instance, &result.folded.pc_witness)
-      .expect("NSC_PC claim should match brute force computation");
+    verify_nsc_pc_claim_bruteforce::<E>(
+      &S_pc,
+      &result.folded.pc_instance,
+      &result.folded.pc_witness,
+    )
+    .expect("NSC_PC claim should match brute force computation");
 
     // 4. Verify new ZC_PC is valid
     verify_zc_pc_valid::<E>(&S_pc, &result.new_zc_pc.0, &result.new_zc_pc.1)
@@ -1070,7 +1103,7 @@ mod tests {
     // 5. Verify NSC linear folding
     verify_nsc_linear_folding::<E>(
       (&nsc_instance, &nsc_witness),
-      (&result.nsc_fresh.0, &result.nsc_fresh.1),
+      (&result.nsc.0, &result.nsc.1),
       &result.folded,
       &result.r_b,
     )
@@ -1079,7 +1112,7 @@ mod tests {
     // 6. Verify NSC_PC linear folding
     verify_nsc_pc_linear_folding::<E>(
       (&nsc_pc_instance, &nsc_pc_witness),
-      (&result.nsc_pc_fresh.0, &result.nsc_pc_fresh.1),
+      (&result.nsc_pc.0, &result.nsc_pc.1),
       &result.folded,
       &result.r_b,
     )
@@ -1088,7 +1121,7 @@ mod tests {
     // 7. Verify commitment homomorphism
     verify_commitment_homomorphism::<E>(
       &nsc_instance,
-      &result.nsc_fresh.0,
+      &result.nsc.0,
       &result.folded.nsc_instance,
       &result.r_b,
     )
@@ -1100,8 +1133,8 @@ mod tests {
       .expect("NSC sumcheck identity should hold");
 
     // 9. Verify sumcheck identity for NSC_PC
-    let T_pc_claim = (E::Scalar::ONE - result.rho) * nsc_pc_instance.T_pc;
-    verify_sumcheck_identity::<E>(&result.nifs_pc.poly_pc, &T_pc_claim)
+    let pc_claim = (E::Scalar::ONE - result.rho) * nsc_pc_instance.pc_sumcheck_claim;
+    verify_sumcheck_identity::<E>(&result.nifs_pc.poly_pc, &pc_claim)
       .expect("NSC_PC sumcheck identity should hold");
   }
 
@@ -1147,24 +1180,36 @@ mod tests {
 
     // Verify fold 1
     str
-      .is_sat(&ck, &result1.folded.nsc_instance, &result1.folded.nsc_witness)
+      .is_sat(
+        &ck,
+        &result1.folded.nsc_instance,
+        &result1.folded.nsc_witness,
+      )
       .expect("Fold 1: NSC should satisfy is_sat");
-    verify_nsc_claim_bruteforce::<E>(&str, &result1.folded.nsc_instance, &result1.folded.nsc_witness)
-      .expect("Fold 1: NSC claim should match");
-    verify_nsc_pc_claim_bruteforce::<E>(&S_pc, &result1.folded.pc_instance, &result1.folded.pc_witness)
-      .expect("Fold 1: NSC_PC claim should match");
+    verify_nsc_claim_bruteforce::<E>(
+      &str,
+      &result1.folded.nsc_instance,
+      &result1.folded.nsc_witness,
+    )
+    .expect("Fold 1: NSC claim should match");
+    verify_nsc_pc_claim_bruteforce::<E>(
+      &S_pc,
+      &result1.folded.pc_instance,
+      &result1.folded.pc_witness,
+    )
+    .expect("Fold 1: NSC_PC claim should match");
     verify_zc_pc_valid::<E>(&S_pc, &result1.new_zc_pc.0, &result1.new_zc_pc.1)
       .expect("Fold 1: New ZC_PC should be valid");
     verify_nsc_linear_folding::<E>(
       (&nsc_instance, &nsc_witness),
-      (&result1.nsc_fresh.0, &result1.nsc_fresh.1),
+      (&result1.nsc.0, &result1.nsc.1),
       &result1.folded,
       &result1.r_b,
     )
     .expect("Fold 1: NSC linear folding should be correct");
     verify_nsc_pc_linear_folding::<E>(
       (&nsc_pc_instance, &nsc_pc_witness),
-      (&result1.nsc_pc_fresh.0, &result1.nsc_pc_fresh.1),
+      (&result1.nsc_pc.0, &result1.nsc_pc.1),
       &result1.folded,
       &result1.r_b,
     )
@@ -1200,24 +1245,32 @@ mod tests {
 
     // Verify fold 2
     str
-      .is_sat(&ck, &result2.folded.nsc_instance, &result2.folded.nsc_witness)
+      .is_sat(
+        &ck,
+        &result2.folded.nsc_instance,
+        &result2.folded.nsc_witness,
+      )
       .expect("Fold 2: NSC should satisfy is_sat");
-    verify_nsc_claim_bruteforce::<E>(&str, &result2.folded.nsc_instance, &result2.folded.nsc_witness)
-      .expect("Fold 2: NSC claim should match");
-    // Note: NSC_PC brute force check only works when T_pc = 0 (initial fold)
-    // After accumulation, T_pc != 0 and the relationship involves eq(ρ, r_b)
+    verify_nsc_claim_bruteforce::<E>(
+      &str,
+      &result2.folded.nsc_instance,
+      &result2.folded.nsc_witness,
+    )
+    .expect("Fold 2: NSC claim should match");
+    // Note: NSC_PC brute force check only works when pc_sumcheck_claim = 0 (initial fold)
+    // After accumulation, pc_sumcheck_claim != 0 and the relationship involves eq(ρ, r_b)
     verify_zc_pc_valid::<E>(&S_pc, &result2.new_zc_pc.0, &result2.new_zc_pc.1)
       .expect("Fold 2: New ZC_PC should be valid");
     verify_nsc_linear_folding::<E>(
       (&nsc_instance, &nsc_witness),
-      (&result2.nsc_fresh.0, &result2.nsc_fresh.1),
+      (&result2.nsc.0, &result2.nsc.1),
       &result2.folded,
       &result2.r_b,
     )
     .expect("Fold 2: NSC linear folding should be correct");
     verify_nsc_pc_linear_folding::<E>(
       (&nsc_pc_instance, &nsc_pc_witness),
-      (&result2.nsc_pc_fresh.0, &result2.nsc_pc_fresh.1),
+      (&result2.nsc_pc.0, &result2.nsc_pc.1),
       &result2.folded,
       &result2.r_b,
     )
@@ -1274,9 +1327,13 @@ mod tests {
       str
         .is_sat(&ck, &result.folded.nsc_instance, &result.folded.nsc_witness)
         .unwrap_or_else(|e| panic!("Step {}: is_sat failed: {:?}", step, e));
-      verify_nsc_claim_bruteforce::<E>(&str, &result.folded.nsc_instance, &result.folded.nsc_witness)
-        .unwrap_or_else(|e| panic!("Step {}: NSC claim failed: {:?}", step, e));
-      // NSC_PC brute force check only works on step 0 when both instances have T_pc = 0
+      verify_nsc_claim_bruteforce::<E>(
+        &str,
+        &result.folded.nsc_instance,
+        &result.folded.nsc_witness,
+      )
+      .unwrap_or_else(|e| panic!("Step {}: NSC claim failed: {:?}", step, e));
+      // NSC_PC brute force check only works on step 0 when both instances have pc_sumcheck_claim = 0
       if step == 0 {
         verify_nsc_pc_claim_bruteforce::<E>(
           &S_pc,
@@ -1289,14 +1346,14 @@ mod tests {
         .unwrap_or_else(|e| panic!("Step {}: ZC_PC validity failed: {:?}", step, e));
       verify_nsc_linear_folding::<E>(
         (&nsc_instance, &nsc_witness),
-        (&result.nsc_fresh.0, &result.nsc_fresh.1),
+        (&result.nsc.0, &result.nsc.1),
         &result.folded,
         &result.r_b,
       )
       .unwrap_or_else(|e| panic!("Step {}: NSC linear folding failed: {:?}", step, e));
       verify_nsc_pc_linear_folding::<E>(
         (&nsc_pc_instance, &nsc_pc_witness),
-        (&result.nsc_pc_fresh.0, &result.nsc_pc_fresh.1),
+        (&result.nsc_pc.0, &result.nsc_pc.1),
         &result.folded,
         &result.r_b,
       )
@@ -1384,7 +1441,8 @@ mod benchmarks {
       .into_par_iter()
       .map(|_| {
         let mut rng = rand::thread_rng();
-        rng.gen::<u8>() % 2
+        let result: u8 = rng.gen();
+        result % 2
       })
       .collect::<Vec<_>>();
 
