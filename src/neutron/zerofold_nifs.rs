@@ -37,7 +37,7 @@ use crate::{
   },
   r1cs::{R1CSInstance, R1CSWitness},
   spartan::polys::univariate::UniPoly,
-  traits::{Engine, RO2Constants, ROTrait},
+  traits::{AbsorbInRO2Trait, Engine, RO2Constants, ROTrait},
   Commitment, CommitmentKey,
 };
 use ff::Field;
@@ -349,6 +349,128 @@ impl<E: Engine> ZeroFoldNIFS<E> {
       r_b,
     })
   }
+
+  /// Verify a ZeroFold proof and return the folded instances.
+  ///
+  /// This replays the Fiat-Shamir transcript from `prove()` to derive the same
+  /// challenges (τ, ρ, γ, r_b), then verifies the sumcheck identities and
+  /// computes the folded instances.
+  ///
+  /// # Arguments
+  /// - `ro_consts`: Random oracle constants (same as prover)
+  /// - `pp_digest`: Public parameters digest (binds the circuit)
+  /// - `U1`: Running (accumulated) NSC instance from prior folds
+  /// - `U1_pc`: Running (accumulated) PowerCheck instance from prior folds
+  /// - `U2`: Fresh R1CS instance being folded in
+  /// - `U2_pc`: Fresh ZC_PC instance (the "hanging" PowerCheck from prior iteration)
+  ///
+  /// # Returns
+  /// - `FoldedInstance`: New folded NSC instance
+  /// - `FoldedPowerCheckInstance`: New folded PowerCheck instance
+  /// - `PowerCheckInstance`: New "hanging" ZC_PC for next iteration
+  #[allow(clippy::type_complexity)]
+  pub fn verify(
+    &self,
+    ro_consts: &RO2Constants<E>,
+    pp_digest: &E::Scalar,
+    // Running instances (accumulated from prior folds)
+    U1: &FoldedInstance<E>,
+    U1_pc: &FoldedPowerCheckInstance<E>,
+    // Fresh instances (public inputs for this folding step)
+    U2: &R1CSInstance<E>,
+    U2_pc: &PowerCheckInstance<E>,
+  ) -> Result<(FoldedInstance<E>, FoldedPowerCheckInstance<E>, PowerCheckInstance<E>), NovaError> {
+    // ========================================
+    // PHASE 1: Replay transcript (must match prove exactly)
+    // ========================================
+    let mut ro = E::RO2::new(ro_consts.clone());
+
+    // Step 1: Absorb pp_digest
+    ro.absorb(*pp_digest);
+
+    // Step 2: Absorb fresh R1CS instance
+    U2.absorb_in_ro2(&mut ro);
+
+    // Step 3: Absorb fresh ZC_PC instance
+    U2_pc.absorb_in_ro2(&mut ro);
+
+    // Step 4: Squeeze τ (used to construct E; verifier gets comm_E from proof)
+    let tau = ro.squeeze(NUM_CHALLENGE_BITS, false);
+
+    // Step 5: Absorb comm_E
+    self.comm_E.absorb_in_ro2(&mut ro);
+
+    // Step 6: Squeeze ρ
+    let rho = ro.squeeze(NUM_CHALLENGE_BITS, false);
+    let one_minus_rho = E::Scalar::ONE - rho;
+
+    // Step 7: Squeeze γ
+    let gamma = ro.squeeze(NUM_CHALLENGE_BITS, false);
+
+    // ========================================
+    // PHASE 2: Verify sumcheck identities
+    // ========================================
+    // Claims for the 1-round sumcheck (fresh instances have T=0, pc_sumcheck_claim=0)
+    // claim = (1-ρ)·T_running + ρ·T_fresh = (1-ρ)·T_running
+    let claim_nsc = one_minus_rho * U1.T;
+    let claim_pc = one_minus_rho * U1_pc.pc_sumcheck_claim;
+
+    // Verify poly_nsc: poly(0) + poly(1) == claim_nsc
+    if self.poly_nsc.eval_at_zero() + self.poly_nsc.eval_at_one() != claim_nsc {
+      return Err(NovaError::InvalidSumcheckProof);
+    }
+
+    // Verify poly_pc: poly(0) + poly(1) == claim_pc
+    if self.poly_pc.eval_at_zero() + self.poly_pc.eval_at_one() != claim_pc {
+      return Err(NovaError::InvalidSumcheckProof);
+    }
+
+    // ========================================
+    // PHASE 3: Absorb combined polynomial and squeeze r_b
+    // ========================================
+    // Prover absorbs poly_combined = poly_nsc + γ·poly_pc
+    let poly_combined = {
+      let poly_pc_scaled = self.poly_pc.scaled(&gamma);
+      self.poly_nsc.add(&poly_pc_scaled)
+    };
+    <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly_combined, &mut ro);
+
+    // Squeeze r_b
+    let r_b = ro.squeeze(NUM_CHALLENGE_BITS, false);
+
+    // ========================================
+    // PHASE 4: Compute output claims
+    // ========================================
+    // eq(ρ, r_b) = (1-ρ)(1-r_b) + ρ·r_b
+    let eq_rho_r_b = one_minus_rho * (E::Scalar::ONE - r_b) + rho * r_b;
+    let eq_inv: E::Scalar =
+      Option::from(eq_rho_r_b.invert()).ok_or(NovaError::DivideByZero)?;
+
+    // T_out = poly(r_b) / eq(ρ, r_b)
+    let T_out_nsc = self.poly_nsc.evaluate(&r_b) * eq_inv;
+    let T_out_pc = self.poly_pc.evaluate(&r_b) * eq_inv;
+
+    // ========================================
+    // PHASE 5: Fold instances
+    // ========================================
+    // Fold NSC instance
+    let folded_nsc = U1.fold(U2, &self.comm_E, &r_b, &T_out_nsc)?;
+
+    // Convert fresh ZC_PC to FoldedPowerCheckInstance for folding
+    // Fresh instance has pc_sumcheck_claim = 0 (exactly satisfied)
+    let U2_pc_folded = FoldedPowerCheckInstance::from_fresh_zc_pc(U2_pc, self.comm_E);
+
+    // Fold PC instance
+    let folded_pc = U1_pc.fold(&U2_pc_folded, &r_b, &T_out_pc);
+
+    // Construct new "hanging" ZC_PC for next iteration
+    let new_zc_pc = PowerCheckInstance {
+      comm_powers: self.comm_E,
+      tau,
+    };
+
+    Ok((folded_nsc, folded_pc, new_zc_pc))
+  }
 }
 
 #[cfg(test)]
@@ -657,6 +779,33 @@ mod tests {
     )
     .expect("ZeroFoldNIFS::prove should succeed");
 
+    // === VERIFY PROOF ===
+    let (verified_nsc, verified_pc, verified_zc_pc) = result
+      .nifs
+      .verify(
+        &ro_consts,
+        &pp_digest,
+        &nsc_instance,
+        &nsc_pc_instance,
+        &u_fresh,
+        &zc_pc_instance,
+      )
+      .expect("ZeroFoldNIFS::verify should succeed");
+
+    // Check verifier output matches prover output
+    assert_eq!(
+      verified_nsc, result.folded.nsc_instance,
+      "Verified NSC instance should match prover's"
+    );
+    assert_eq!(
+      verified_pc, result.folded.pc_instance,
+      "Verified PC instance should match prover's"
+    );
+    assert_eq!(
+      verified_zc_pc, result.new_zc_pc.0,
+      "Verified ZC_PC should match prover's"
+    );
+
     // === VERIFY FINAL STATE ===
 
     // 1. Verify Structure::is_sat
@@ -772,6 +921,11 @@ mod tests {
     let (u2, w2) = generate_satisfying_witness::<E>(&shape, &ck, 3, num_cons);
 
     // === FOLD 1 ===
+    // Save state before fold for verify
+    let nsc_instance_before_fold1 = nsc_instance.clone();
+    let nsc_pc_instance_before_fold1 = nsc_pc_instance.clone();
+    let zc_pc_instance_before_fold1 = zc_pc_instance.clone();
+
     let result1 = ZeroFoldNIFS::prove(
       &ck,
       &ro_consts,
@@ -785,6 +939,22 @@ mod tests {
       (&zc_pc_instance, &zc_pc_witness),
     )
     .expect("Fold 1 should succeed");
+
+    // Verify fold 1 proof
+    let (verified_nsc1, verified_pc1, verified_zc_pc1) = result1
+      .nifs
+      .verify(
+        &ro_consts,
+        &pp_digest,
+        &nsc_instance_before_fold1,
+        &nsc_pc_instance_before_fold1,
+        &u1,
+        &zc_pc_instance_before_fold1,
+      )
+      .expect("Fold 1: verify should succeed");
+    assert_eq!(verified_nsc1, result1.folded.nsc_instance, "Fold 1: verified NSC should match");
+    assert_eq!(verified_pc1, result1.folded.pc_instance, "Fold 1: verified PC should match");
+    assert_eq!(verified_zc_pc1, result1.new_zc_pc.0, "Fold 1: verified ZC_PC should match");
 
     // Verify fold 1
     str
@@ -823,6 +993,11 @@ mod tests {
     zc_pc_witness = result1.new_zc_pc.1.clone();
 
     // === FOLD 2 ===
+    // Save state before fold for verify
+    let nsc_instance_before_fold2 = nsc_instance.clone();
+    let nsc_pc_instance_before_fold2 = nsc_pc_instance.clone();
+    let zc_pc_instance_before_fold2 = zc_pc_instance.clone();
+
     let result2 = ZeroFoldNIFS::prove(
       &ck,
       &ro_consts,
@@ -836,6 +1011,22 @@ mod tests {
       (&zc_pc_instance, &zc_pc_witness),
     )
     .expect("Fold 2 should succeed");
+
+    // Verify fold 2 proof
+    let (verified_nsc2, verified_pc2, verified_zc_pc2) = result2
+      .nifs
+      .verify(
+        &ro_consts,
+        &pp_digest,
+        &nsc_instance_before_fold2,
+        &nsc_pc_instance_before_fold2,
+        &u2,
+        &zc_pc_instance_before_fold2,
+      )
+      .expect("Fold 2: verify should succeed");
+    assert_eq!(verified_nsc2, result2.folded.nsc_instance, "Fold 2: verified NSC should match");
+    assert_eq!(verified_pc2, result2.folded.pc_instance, "Fold 2: verified PC should match");
+    assert_eq!(verified_zc_pc2, result2.new_zc_pc.0, "Fold 2: verified ZC_PC should match");
 
     // Verify fold 2
     str
@@ -888,6 +1079,11 @@ mod tests {
       .collect();
 
     for (step, (u, w)) in witnesses.iter().enumerate() {
+      // Save state before fold for verify
+      let nsc_instance_before = nsc_instance.clone();
+      let nsc_pc_instance_before = nsc_pc_instance.clone();
+      let zc_pc_instance_before = zc_pc_instance.clone();
+
       let result = ZeroFoldNIFS::prove(
         &ck,
         &ro_consts,
@@ -901,6 +1097,34 @@ mod tests {
         (&zc_pc_instance, &zc_pc_witness),
       )
       .unwrap_or_else(|e| panic!("Step {}: ZeroFoldNIFS::prove failed: {:?}", step, e));
+
+      // Verify the proof
+      let (verified_nsc, verified_pc, verified_zc_pc) = result
+        .nifs
+        .verify(
+          &ro_consts,
+          &pp_digest,
+          &nsc_instance_before,
+          &nsc_pc_instance_before,
+          u,
+          &zc_pc_instance_before,
+        )
+        .unwrap_or_else(|e| panic!("Step {}: ZeroFoldNIFS::verify failed: {:?}", step, e));
+      assert_eq!(
+        verified_nsc, result.folded.nsc_instance,
+        "Step {}: verified NSC should match",
+        step
+      );
+      assert_eq!(
+        verified_pc, result.folded.pc_instance,
+        "Step {}: verified PC should match",
+        step
+      );
+      assert_eq!(
+        verified_zc_pc, result.new_zc_pc.0,
+        "Step {}: verified ZC_PC should match",
+        step
+      );
 
       // Verify all invariants
       str
