@@ -85,16 +85,11 @@ pub struct FoldedState<E: Engine> {
 }
 
 /// Output of ZeroFold prove (handles both NSC and NSC_PC)
-///
-/// Per NeutronNova Construction 4: The proof contains a SINGLE combined polynomial
-/// `poly = poly_nsc + γ·poly_pc` where γ is a random challenge.
 #[derive(Clone, Debug)]
 pub struct ZeroFoldOutput<E: Engine> {
   // === Proof ===
-  /// ZeroFold proof (comm_E, combined poly, T_out_pc)
+  /// ZeroFold proof (comm_E, poly_nsc, poly_pc)
   pub nifs: ZeroFoldNIFS<E>,
-  /// γ challenge used to combine NSC and NSC_PC polynomials
-  pub gamma: E::Scalar,
 
   // === Folded results ===
   /// Folded state containing NSC + NSC_PC + cached Az/Bz/Cz
@@ -318,7 +313,6 @@ impl<E: Engine> ZeroFoldNIFS<E> {
       &mut ro,
     )?;
 
-    let gamma = sumcheck_out.gamma;
     let r_b = sumcheck_out.r_b;
 
     // === PHASE 5: Fold both NSC and NSC_PC ===
@@ -341,7 +335,6 @@ impl<E: Engine> ZeroFoldNIFS<E> {
         poly_nsc: sumcheck_out.poly_nsc,
         poly_pc: sumcheck_out.poly_pc,
       },
-      gamma,
       folded,
       new_zc_pc: conv.zc_pc,
       tau: conv.tau,
@@ -404,9 +397,6 @@ impl<E: Engine> ZeroFoldNIFS<E> {
     let rho = ro.squeeze(NUM_CHALLENGE_BITS, false);
     let one_minus_rho = E::Scalar::ONE - rho;
 
-    // Step 7: Squeeze γ
-    let gamma = ro.squeeze(NUM_CHALLENGE_BITS, false);
-
     // ========================================
     // PHASE 2: Verify sumcheck identities
     // ========================================
@@ -426,16 +416,12 @@ impl<E: Engine> ZeroFoldNIFS<E> {
     }
 
     // ========================================
-    // PHASE 3: Absorb combined polynomial and squeeze r_b
+    // PHASE 3: Absorb BOTH polynomials and squeeze r_b
     // ========================================
-    // Prover absorbs poly_combined = poly_nsc + γ·poly_pc
-    let poly_combined = {
-      let poly_pc_scaled = self.poly_pc.scaled(&gamma);
-      self.poly_nsc.add(&poly_pc_scaled)
-    };
-    <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly_combined, &mut ro);
-
-    // Squeeze r_b
+    // SECURITY: We must absorb both polynomials independently, not just their
+    // linear combination. See comment in run_combined_sumfold for the Δ-trick attack.
+    <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&self.poly_nsc, &mut ro);
+    <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&self.poly_pc, &mut ro);
     let r_b = ro.squeeze(NUM_CHALLENGE_BITS, false);
 
     // ========================================

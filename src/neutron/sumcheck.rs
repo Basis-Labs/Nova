@@ -80,24 +80,6 @@ pub fn verify_output_claim_consistency<F: PrimeField + CustomSerdeTrait>(
   Ok(())
 }
 
-/// Verify combined polynomial decomposition: poly(r_b) = poly_nsc(r_b) + γ·poly_pc(r_b)
-///
-/// The combined proof polynomial must equal the sum of the NSC and scaled PC polynomials.
-pub fn verify_combined_poly_decomposition<F: PrimeField + CustomSerdeTrait>(
-  poly: &UniPoly<F>,
-  poly_nsc: &UniPoly<F>,
-  poly_pc: &UniPoly<F>,
-  gamma: &F,
-  r_b: &F,
-) -> Result<(), NovaError> {
-  let combined_at_r_b = poly.evaluate(r_b);
-  let expected = poly_nsc.evaluate(r_b) + *gamma * poly_pc.evaluate(r_b);
-  if combined_at_r_b != expected {
-    return Err(NovaError::InvalidSumcheckProof);
-  }
-  Ok(())
-}
-
 /// Accumulates bound function evaluations into an existing accumulator.
 ///
 /// Fold-friendly: takes acc, returns updated acc. Works with rayon fold + reduce.
@@ -235,15 +217,12 @@ pub fn sumcheck_round<F: PrimeField + CustomSerdeTrait>(
 /// Output of combined NSC + NSC_PC sumcheck (Construction 4)
 ///
 /// Contains two separate sumcheck polynomials for independent verification.
-/// The γ challenge is still used for transcript binding (Fiat-Shamir).
 #[derive(Clone, Debug)]
 pub struct CombinedSumcheckOutput<E: Engine> {
   /// NSC sumcheck polynomial
   pub poly_nsc: UniPoly<E::Scalar>,
   /// PowerCheck sumcheck polynomial
   pub poly_pc: UniPoly<E::Scalar>,
-  /// γ challenge used for transcript binding
-  pub gamma: E::Scalar,
   /// Folding challenge r_b
   pub r_b: E::Scalar,
   /// Output sumcheck claim for NSC (needed for folding)
@@ -285,17 +264,14 @@ pub fn run_combined_sumfold<E: Engine>(
   // Transcript
   transcript: &mut E::RO2,
 ) -> Result<CombinedSumcheckOutput<E>, NovaError> {
-  // Step 1: Sample γ challenge for combining NSC and NSC_PC
-  let gamma = transcript.squeeze(NUM_CHALLENGE_BITS, false);
-
-  // Step 2: Compute sumcheck claims
+  // Step 1: Compute sumcheck claims
   // sumcheck_claim_nsc = (1-ρ)·claim_running + ρ·claim_fresh where claim_fresh = 0
   let one_minus_rho = E::Scalar::ONE - rho;
   let sumcheck_claim_nsc = one_minus_rho * nsc_claim_running;
   // sumcheck_claim_pc = (1-ρ)·claim_running + ρ·claim_fresh where claim_fresh = 0
   let sumcheck_claim_pc = one_minus_rho * nsc_pc_claim_running;
 
-  // Step 3: Run NSC sumcheck
+  // Step 2: Run NSC sumcheck
   let evals_nsc: EvalAcc<E::Scalar> = prove_helper::<E>(
     rho,
     dims,
@@ -313,7 +289,7 @@ pub fn run_combined_sumfold<E: Engine>(
   // Verify NSC sumcheck identity: poly_nsc(0) + poly_nsc(1) = claim
   verify_sumcheck_identity(&poly_nsc, &sumcheck_claim_nsc)?;
 
-  // Step 4: Run NSC_PC sumcheck
+  // Step 3: Run NSC_PC sumcheck
   let evals_pc: EvalAcc<E::Scalar> = prove_helper_pc::<E>(
     rho,
     S_pc,
@@ -329,23 +305,16 @@ pub fn run_combined_sumfold<E: Engine>(
   // Verify NSC_PC sumcheck identity: poly_pc(0) + poly_pc(1) = claim
   verify_sumcheck_identity(&poly_pc, &sumcheck_claim_pc)?;
 
-  // Step 5: Combine with γ for transcript binding (Fiat-Shamir)
-  // The combined polynomial binds both polynomials to the transcript,
-  // but we return individual polynomials in the proof for independent verification.
-  let poly_combined = {
-    let poly_pc_scaled = poly_pc.scaled(&gamma);
-    poly_nsc.add(&poly_pc_scaled)
-  };
-
-  // Verify combined sumcheck identity: poly(0) + poly(1) = T_nsc + γ·T_pc
-  let combined_claim = sumcheck_claim_nsc + gamma * sumcheck_claim_pc;
-  verify_sumcheck_identity(&poly_combined, &combined_claim)?;
-
-  // Step 6: Absorb combined poly in transcript, squeeze r_b
-  <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly_combined, transcript);
+  // Step 4: Absorb BOTH polynomials in transcript, squeeze r_b
+  //
+  // SECURITY: We absorb both polynomials independently to prevent the "Δ-trick"
+  // malleability attack where a prover could shift output claims while keeping
+  // the transcript unchanged.
+  <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly_nsc, transcript);
+  <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly_pc, transcript);
   let r_b = transcript.squeeze(NUM_CHALLENGE_BITS, false);
 
-  // Step 7: Compute output claims
+  // Step 5: Compute output claims
   let eq_rho_r_b = one_minus_rho * (E::Scalar::ONE - r_b) + *rho * r_b;
   let eq_rho_r_b_inv: E::Scalar =
     Option::from(eq_rho_r_b.invert()).ok_or(NovaError::DivideByZero)?;
@@ -357,13 +326,9 @@ pub fn run_combined_sumfold<E: Engine>(
   verify_output_claim_consistency(&poly_nsc, &r_b, &sumcheck_claim_out_nsc, &eq_rho_r_b)?;
   verify_output_claim_consistency(&poly_pc, &r_b, &sumcheck_claim_out_pc, &eq_rho_r_b)?;
 
-  // Verify combined polynomial decomposition: poly(r_b) = poly_nsc(r_b) + γ·poly_pc(r_b)
-  verify_combined_poly_decomposition(&poly_combined, &poly_nsc, &poly_pc, &gamma, &r_b)?;
-
   Ok(CombinedSumcheckOutput {
     poly_nsc,
     poly_pc,
-    gamma,
     r_b,
     sumcheck_claim_out_nsc,
     sumcheck_claim_out_pc,
