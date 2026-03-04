@@ -28,6 +28,10 @@ pub mod r1cs;
 pub mod spartan;
 pub mod traits;
 
+// arkworks circuit integration (requires `arkworks` feature)
+#[cfg(feature = "arkworks")]
+pub mod arkworks;
+
 use traits::{commitment::CommitmentEngineTrait, Engine};
 
 // some type aliases
