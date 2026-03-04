@@ -1,20 +1,26 @@
-//! This module implements a non-interactive folding scheme from NeutronNova
+//! This module implements the basic NIFS (Non-Interactive Folding Scheme) for NeutronNova
+//!
+//! For the complete ZeroFold prover (NSC + NSC_PC), see `zerofold_nifs.rs`.
 #![allow(non_snake_case)]
 use crate::{
   constants::NUM_CHALLENGE_BITS,
   errors::NovaError,
-  neutron::relation::{FoldedInstance, FoldedWitness, Structure},
+  neutron::{
+    relation::{FoldedInstance, FoldedWitness, Structure},
+    sumcheck::{prove_helper, EvalAcc},
+    weight_table::WeightTable,
+  },
   r1cs::{R1CSInstance, R1CSWitness},
-  spartan::polys::{power::PowPolynomial, univariate::UniPoly},
-  traits::{commitment::CommitmentEngineTrait, AbsorbInRO2Trait, Engine, RO2Constants, ROTrait},
-  Commitment, CommitmentKey, CE,
+  spartan::polys::univariate::UniPoly,
+  traits::{AbsorbInRO2Trait, Engine, RO2Constants, ROTrait},
+  Commitment, CommitmentKey,
 };
 use ff::Field;
-use rand_core::OsRng;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-/// An NIFS message from NeutronNova's folding scheme
+/// An NIFS message from NeutronNova's folding scheme (single NSC relation)
+///
+/// For the combined NSC + NSC_PC proof, see `ZeroFoldNIFS` in `zerofold_nifs.rs`.
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
@@ -24,167 +30,6 @@ pub struct NIFS<E: Engine> {
 }
 
 impl<E: Engine> NIFS<E> {
-  /// Computes the evaluations of the sum-check polynomial at 0, 2, 3, and 4
-  #[inline]
-  fn prove_helper(
-    rho: &E::Scalar,
-    (left, right): (usize, usize),
-    e1: &[E::Scalar],
-    Az1: &[E::Scalar],
-    Bz1: &[E::Scalar],
-    Cz1: &[E::Scalar],
-    e2: &[E::Scalar],
-    Az2: &[E::Scalar],
-    Bz2: &[E::Scalar],
-    Cz2: &[E::Scalar],
-  ) -> (E::Scalar, E::Scalar, E::Scalar, E::Scalar, E::Scalar) {
-    // sanity check sizes
-    assert_eq!(e1.len(), left + right);
-    assert_eq!(Az1.len(), left * right);
-    assert_eq!(Bz1.len(), left * right);
-    assert_eq!(Cz1.len(), left * right);
-    assert_eq!(e2.len(), left + right);
-    assert_eq!(Az2.len(), left * right);
-    assert_eq!(Bz2.len(), left * right);
-    assert_eq!(Cz2.len(), left * right);
-
-    let comb_func = |c1: &E::Scalar, c2: &E::Scalar, c3: &E::Scalar, c4: &E::Scalar| -> E::Scalar {
-      *c1 * (*c2 * *c3 - *c4)
-    };
-    let (eval_at_0, eval_at_2, eval_at_3, eval_at_4, eval_at_5) = (0..right)
-      .into_par_iter()
-      .map(|i| {
-        let (i_eval_at_0, i_eval_at_2, i_eval_at_3, i_eval_at_4, i_eval_at_5) = (0..left)
-          .into_par_iter()
-          .map(|j| {
-            // Turn the two dimensional (i, j) into a single dimension index
-            let k = i * left + j;
-
-            // eval 0: bound_func is A(low)
-            let eval_point_0 = comb_func(&e1[j], &Az1[k], &Bz1[k], &Cz1[k]);
-
-            // eval 2: bound_func is -A(low) + 2*A(high)
-            let poly_e_bound_point = e2[j] + e2[j] - e1[j];
-            let poly_Az_bound_point = Az2[k] + Az2[k] - Az1[k];
-            let poly_Bz_bound_point = Bz2[k] + Bz2[k] - Bz1[k];
-            let poly_Cz_bound_point = Cz2[k] + Cz2[k] - Cz1[k];
-            let eval_point_2 = comb_func(
-              &poly_e_bound_point,
-              &poly_Az_bound_point,
-              &poly_Bz_bound_point,
-              &poly_Cz_bound_point,
-            );
-
-            // eval 3: bound_func is -2A(low) + 3A(high); computed incrementally with bound_func applied to eval(2)
-            let poly_e_bound_point = poly_e_bound_point + e2[j] - e1[j];
-            let poly_Az_bound_point = poly_Az_bound_point + Az2[k] - Az1[k];
-            let poly_Bz_bound_point = poly_Bz_bound_point + Bz2[k] - Bz1[k];
-            let poly_Cz_bound_point = poly_Cz_bound_point + Cz2[k] - Cz1[k];
-            let eval_point_3 = comb_func(
-              &poly_e_bound_point,
-              &poly_Az_bound_point,
-              &poly_Bz_bound_point,
-              &poly_Cz_bound_point,
-            );
-
-            // eval 4: bound_func is -3A(low) + 4A(high); computed incrementally with bound_func applied to eval(3)
-            let poly_e_bound_point = poly_e_bound_point + e2[j] - e1[j];
-            let poly_Az_bound_point = poly_Az_bound_point + Az2[k] - Az1[k];
-            let poly_Bz_bound_point = poly_Bz_bound_point + Bz2[k] - Bz1[k];
-            let poly_Cz_bound_point = poly_Cz_bound_point + Cz2[k] - Cz1[k];
-            let eval_point_4 = comb_func(
-              &poly_e_bound_point,
-              &poly_Az_bound_point,
-              &poly_Bz_bound_point,
-              &poly_Cz_bound_point,
-            );
-
-            // eval 5: bound_func is -4A(low) + 5A(high); computed incrementally with bound_func applied to eval(4)
-            let poly_e_bound_point = poly_e_bound_point + e2[j] - e1[j];
-            let poly_Az_bound_point = poly_Az_bound_point + Az2[k] - Az1[k];
-            let poly_Bz_bound_point = poly_Bz_bound_point + Bz2[k] - Bz1[k];
-            let poly_Cz_bound_point = poly_Cz_bound_point + Cz2[k] - Cz1[k];
-            let eval_point_5 = comb_func(
-              &poly_e_bound_point,
-              &poly_Az_bound_point,
-              &poly_Bz_bound_point,
-              &poly_Cz_bound_point,
-            );
-
-            (
-              eval_point_0,
-              eval_point_2,
-              eval_point_3,
-              eval_point_4,
-              eval_point_5,
-            )
-          })
-          .reduce(
-            || {
-              (
-                E::Scalar::ZERO,
-                E::Scalar::ZERO,
-                E::Scalar::ZERO,
-                E::Scalar::ZERO,
-                E::Scalar::ZERO,
-              )
-            },
-            |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3, a.4 + b.4),
-          );
-
-        let f1 = &e1[left..];
-        let f2 = &e2[left..];
-
-        // eval 0: bound_func is A(low)
-        let eval_at_0 = f1[i] * i_eval_at_0;
-
-        // eval 2: bound_func is -A(low) + 2*A(high)
-        let poly_f_bound_point = f2[i] + f2[i] - f1[i];
-        let eval_at_2 = poly_f_bound_point * i_eval_at_2;
-
-        // eval 3: bound_func is -2A(low) + 3A(high); computed incrementally with bound_func applied to eval(2)
-        let poly_f_bound_point = poly_f_bound_point + f2[i] - f1[i];
-        let eval_at_3 = poly_f_bound_point * i_eval_at_3;
-
-        // eval 4: bound_func is -3A(low) + 4A(high); computed incrementally with bound_func applied to eval(3)
-        let poly_f_bound_point = poly_f_bound_point + f2[i] - f1[i];
-        let eval_at_4 = poly_f_bound_point * i_eval_at_4;
-
-        // eval 5: bound_func is -4A(low) + 5A(high); computed incrementally with bound_func applied to eval(4)
-        let poly_f_bound_point = poly_f_bound_point + f2[i] - f1[i];
-        let eval_at_5 = poly_f_bound_point * i_eval_at_5;
-
-        (eval_at_0, eval_at_2, eval_at_3, eval_at_4, eval_at_5)
-      })
-      .reduce(
-        || {
-          (
-            E::Scalar::ZERO,
-            E::Scalar::ZERO,
-            E::Scalar::ZERO,
-            E::Scalar::ZERO,
-            E::Scalar::ZERO,
-          )
-        },
-        |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3, a.4 + b.4),
-      );
-
-    // multiply by the common factors
-    let one_minus_rho = E::Scalar::ONE - rho;
-    let three_rho_minus_one = E::Scalar::from(3) * rho - E::Scalar::ONE;
-    let five_rho_minus_two = E::Scalar::from(5) * rho - E::Scalar::from(2);
-    let seven_rho_minus_three = E::Scalar::from(7) * rho - E::Scalar::from(3);
-    let nine_rho_minus_four = E::Scalar::from(9) * rho - E::Scalar::from(4);
-
-    (
-      eval_at_0 * one_minus_rho,
-      eval_at_2 * three_rho_minus_one,
-      eval_at_3 * five_rho_minus_two,
-      eval_at_4 * seven_rho_minus_three,
-      eval_at_5 * nine_rho_minus_four,
-    )
-  }
-
   /// Takes as input a folded instance-witness tuple `(U1, W1)` and
   /// an R1CS instance-witness tuple `(U2, W2)` with a compatible structure `shape`
   /// and defined with respect to the same `ck`, and outputs
@@ -220,9 +65,8 @@ impl<E: Engine> NIFS<E> {
     let tau = ro.squeeze(NUM_CHALLENGE_BITS, false);
 
     // compute a commitment to the eq polynomial
-    let E = PowPolynomial::new(&tau, S.ell).split_evals(S.left, S.right);
-    let r_E = E::Scalar::random(&mut OsRng);
-    let comm_E = CE::<E>::commit(ck, &E, &r_E);
+    let E = WeightTable::from_tau(&tau, S.left, S.right);
+    let comm_E: Commitment<E> = E.commit(ck);
 
     comm_E.absorb_in_ro2(&mut ro); // absorb the commitment in the NIFS
 
@@ -248,18 +92,19 @@ impl<E: Engine> NIFS<E> {
     let (Az2, Bz2, Cz2) = res2?;
 
     // compute the sum-check polynomial's evaluations at 0, 2, 3
-    let (eval_point_0, eval_point_2, eval_point_3, eval_point_4, eval_point_5) = Self::prove_helper(
-      &rho,
-      (S.left, S.right),
-      &W1.E,
-      &Az1,
-      &Bz1,
-      &Cz1,
-      &E,
-      &Az2,
-      &Bz2,
-      &Cz2,
-    );
+    let (eval_point_0, eval_point_2, eval_point_3, eval_point_4, eval_point_5): EvalAcc<E::Scalar> =
+      prove_helper::<E>(
+        &rho,
+        (S.left, S.right),
+        W1.E.as_slice(),
+        &Az1,
+        &Bz1,
+        &Cz1,
+        E.as_slice(),
+        &Az2,
+        &Bz2,
+        &Cz2,
+      );
 
     let evals = vec![
       eval_point_0,
@@ -271,6 +116,14 @@ impl<E: Engine> NIFS<E> {
     ];
     let poly = UniPoly::<E::Scalar>::from_evals(&evals);
 
+    // === ASSERT: Sumcheck Identity ===
+    // poly(0) + poly(1) = (1-ρ)·T_running + ρ·T_fresh where T_fresh = 0
+    assert_eq!(
+      poly.eval_at_zero() + poly.eval_at_one(),
+      T,
+      "Sumcheck identity violated: poly(0) + poly(1) ≠ (1-ρ)·T_running"
+    );
+
     // absorb poly in the RO
     <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly, &mut ro);
 
@@ -279,10 +132,20 @@ impl<E: Engine> NIFS<E> {
 
     // compute the sum-check polynomial's evaluations at r_b
     let eq_rho_r_b = (E::Scalar::ONE - rho) * (E::Scalar::ONE - r_b) + rho * r_b;
-    let T_out = poly.evaluate(&r_b) * eq_rho_r_b.invert().unwrap(); // TODO: remove unwrap
+    let eq_rho_r_b_inv: E::Scalar =
+      Option::from(eq_rho_r_b.invert()).ok_or(NovaError::DivideByZero)?;
+    let T_out = poly.evaluate(&r_b) * eq_rho_r_b_inv;
+
+    // === ASSERT: Output Claim Consistency ===
+    // poly(r_b) = T_out · eq(ρ, r_b)
+    assert_eq!(
+      poly.evaluate(&r_b),
+      T_out * eq_rho_r_b,
+      "Output claim inconsistent: poly(r_b) ≠ T_out · eq(ρ, r_b)"
+    );
 
     let U = U1.fold(U2, &comm_E, &r_b, &T_out)?;
-    let W = W1.fold(W2, &E, &r_E, &r_b)?;
+    let W = W1.fold(W2, &E, &r_b)?;
 
     // return the folded instance and witness
     Ok((Self { comm_E, poly }, (U, W)))
@@ -300,6 +163,9 @@ impl<E: Engine> NIFS<E> {
     pp_digest: &E::Scalar,
     U1: &FoldedInstance<E>,
     U2: &R1CSInstance<E>,
+    // TODO: U_PC: FoldedPowerCheckInstance
+    // TODO: Generated PowerCheckInstance (Maybe)
+    // U2
   ) -> Result<FoldedInstance<E>, NovaError> {
     // initialize a new RO
     let mut ro = E::RO2::new(ro_consts.clone());
@@ -310,21 +176,31 @@ impl<E: Engine> NIFS<E> {
     // append U2 to transcript
     U2.absorb_in_ro2(&mut ro);
 
+    // TODO: absorb U_pc
+
     // generate a challenge for the eq polynomial
     let _tau = ro.squeeze(NUM_CHALLENGE_BITS, false);
 
     self.comm_E.absorb_in_ro2(&mut ro); // absorb the commitment in the NIFS
 
+    // Check that tau and comm_E is equal to the generated nested power check instance
+    //
+
+    // TODO: We should also try to convert the R1CSInstance and PowerCheckInstance into their folding counterparts by this time
+
     // compute a challenge from the RO
     let rho = ro.squeeze(NUM_CHALLENGE_BITS, false);
 
+    // TODO: Using the sumcheck for all the NSC relations. Add them up together and the check with the polynomial
+
     // T = (1-rho) * T1 + rho * T2, where T1 comes from the running instance and T2 = 0
     let T = (E::Scalar::ONE - rho) * U1.T;
-
     // check if poly(0) + poly(1) = T
     if self.poly.eval_at_zero() + self.poly.eval_at_one() != T {
       return Err(NovaError::InvalidSumcheckProof);
     }
+
+    // TODO: Now note that the sumchecks of the folded NSC and NSC_PC are computed already.
 
     // absorb poly in the RO
     <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&self.poly, &mut ro);
@@ -334,9 +210,23 @@ impl<E: Engine> NIFS<E> {
 
     // compute the sum-check polynomial's evaluations at r_b
     let eq_rho_r_b = (E::Scalar::ONE - rho) * (E::Scalar::ONE - r_b) + rho * r_b;
-    let T_out = self.poly.evaluate(&r_b) * eq_rho_r_b.invert().unwrap(); // TODO: remove unwrap
+    let eq_rho_r_b_inv: E::Scalar =
+      Option::from(eq_rho_r_b.invert()).ok_or(NovaError::DivideByZero)?;
+    let T_out = self.poly.evaluate(&r_b) * eq_rho_r_b_inv;
+
+    /////////////NOTE - We should do this for the verifier
+    // let r_b = transcript.squeeze(NUM_CHALLENGE_BITS, false);
+
+    // // Step 7: Compute output claims
+    // let eq_rho_r_b = one_minus_rho * (E::Scalar::ONE - r_b) + *rho * r_b;
+    // let eq_rho_r_b_inv: E::Scalar =
+    //   Option::from(eq_rho_r_b.invert()).ok_or(NovaError::DivideByZero)?;
+
+    // let sumcheck_claim_out_nsc = poly_nsc.evaluate(&r_b) * eq_rho_r_b_inv;
+    // let sumcheck_claim_out_pc = poly_pc.evaluate(&r_b) * eq_rho_r_b_inv;
 
     let U = U1.fold(U2, &self.comm_E, &r_b, &T_out)?;
+    // TODO: update the ZeroCheck Instance here as well with a fold.
 
     // return the folded instance and witness
     Ok(U)
@@ -361,7 +251,6 @@ mod tests {
     spartan::{direct::DirectCircuit, snark::RelaxedR1CSSNARK},
     traits::{circuit::NonTrivialCircuit, snark::RelaxedR1CSSNARKTrait, Engine, RO2Constants},
   };
-  use ff::Field;
 
   fn execute_sequence<E: Engine>(
     ck: &CommitmentKey<E>,
@@ -521,7 +410,7 @@ mod benchmarks {
     nova::nifs::NIFS as NovaNIFS,
     provider::Bn256EngineKZG,
     r1cs::{R1CSShape, SparseMatrix},
-    traits::{snark::default_ck_hint, ROConstants},
+    traits::{commitment::CommitmentEngineTrait, snark::default_ck_hint, ROConstants},
   };
   use core::marker::PhantomData;
   use criterion::Criterion;
@@ -529,6 +418,7 @@ mod benchmarks {
   use num_integer::Integer;
   use num_traits::ToPrimitive;
   use rand::Rng;
+  use rayon::prelude::*;
 
   /// generates a satisfying R1CS with small witness values
   fn generate_sample_r1cs<E: Engine>(
@@ -567,7 +457,8 @@ mod benchmarks {
       .into_par_iter()
       .map(|_| {
         let mut rng = rand::thread_rng();
-        rng.gen::<u8>() % 2
+        let result: u8 = rng.gen();
+        result % 2
       })
       .collect::<Vec<_>>();
 

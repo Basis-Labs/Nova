@@ -24,9 +24,11 @@ use ff::Field;
 use serde::{Deserialize, Serialize};
 
 pub mod nifs;
+pub mod power_check_relation;
 pub mod r1cs;
 pub mod relation;
 pub mod univariate;
+pub mod zerofold_nifs;
 
 use nifs::AllocatedNIFS;
 use r1cs::AllocatedNonnativeR1CSInstance;

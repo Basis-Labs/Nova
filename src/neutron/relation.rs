@@ -1,6 +1,7 @@
 //! This module defines relations used in the Neutron folding scheme
 use crate::{
   errors::NovaError,
+  neutron::weight_table::WeightTable,
   r1cs::{R1CSInstance, R1CSShape, R1CSWitness},
   spartan::math::Math,
   traits::{commitment::CommitmentEngineTrait, AbsorbInRO2Trait, Engine, ROTrait},
@@ -29,11 +30,11 @@ pub struct Structure<E: Engine> {
 pub struct FoldedWitness<E: Engine> {
   /// Running witness of the main relation
   pub(crate) W: Vec<E::Scalar>,
-  r_W: E::Scalar,
+  /// Commitment randomness for W
+  pub(crate) r_W: E::Scalar,
 
-  /// eq polynomial in tensor form
-  pub(crate) E: Vec<E::Scalar>,
-  r_E: E::Scalar,
+  /// Weight table in tensor form [e₁ || e₂]
+  pub(crate) E: WeightTable<E>,
 }
 
 /// A type that holds instance information for a zero-fold relation
@@ -80,7 +81,7 @@ impl<E: Engine> Structure<E> {
 
     // full_E is the outer product of E1 and E2
     // E1 and E2 are splits of E
-    let (E1, E2) = W.E.split_at(self.left);
+    let (E1, E2) = (W.E.e1(), W.E.e2());
     let mut full_E = vec![E::Scalar::ONE; self.left * self.right];
     for i in 0..self.right {
       for j in 0..self.left {
@@ -104,7 +105,7 @@ impl<E: Engine> Structure<E> {
 
     // check the validity of the commitments
     let comm_W = E::CE::commit(ck, &W.W, &W.r_W);
-    let comm_E = E::CE::commit(ck, &W.E, &W.r_E);
+    let comm_E = W.E.commit(ck);
 
     if comm_W != U.comm_W || comm_E != U.comm_E {
       return Err(NovaError::UnSat {
@@ -117,13 +118,32 @@ impl<E: Engine> Structure<E> {
 }
 
 impl<E: Engine> FoldedWitness<E> {
+  /// Create a new FoldedWitness with the given components
+  pub fn new(W: Vec<E::Scalar>, r_W: E::Scalar, E: WeightTable<E>) -> Self {
+    Self { W, r_W, E }
+  }
+
+  /// Create a FoldedWitness from an R1CS witness and weight table
+  ///
+  /// This "lifts" a fresh R1CS witness to folded form for use in folding.
+  pub fn from_r1cs(w: &R1CSWitness<E>, E: WeightTable<E>) -> Self {
+    Self {
+      W: w.W.clone(),
+      r_W: w.r_W,
+      E,
+    }
+  }
+
   /// Create a default witness
   pub fn default(S: &Structure<E>) -> Self {
     FoldedWitness {
       W: vec![E::Scalar::ZERO; S.S.num_vars],
       r_W: E::Scalar::ZERO,
-      E: vec![E::Scalar::ZERO; S.left + S.right],
-      r_E: E::Scalar::ZERO,
+      E: WeightTable::new(
+        vec![E::Scalar::ZERO; S.left + S.right],
+        E::Scalar::ZERO,
+        S.left,
+      ),
     }
   }
 
@@ -131,8 +151,7 @@ impl<E: Engine> FoldedWitness<E> {
   pub fn fold(
     &self,
     W2: &R1CSWitness<E>,
-    E2: &Vec<E::Scalar>,
-    r_E2: &E::Scalar,
+    E2: &WeightTable<E>,
     r_b: &E::Scalar,
   ) -> Result<Self, NovaError> {
     // we need to compute the weighted sum using weights of (1-r_b) and r_b
@@ -144,15 +163,27 @@ impl<E: Engine> FoldedWitness<E> {
       .collect::<Vec<_>>();
     let r_W = (E::Scalar::ONE - r_b) * self.r_W + *r_b * W2.r_W;
 
-    let E = self
-      .E
-      .par_iter()
-      .zip(E2.par_iter())
-      .map(|(e1, e2)| *e1 + *r_b * (*e2 - *e1))
-      .collect::<Vec<_>>();
-    let r_E = (E::Scalar::ONE - r_b) * self.r_E + *r_b * r_E2;
+    let E = self.E.fold(E2, r_b);
 
-    Ok(Self { W, r_W, E, r_E })
+    Ok(Self { W, r_W, E })
+  }
+
+  /// Fold two FoldedWitnesses together
+  ///
+  /// Unlike `fold` which folds with a fresh R1CSWitness, this folds two
+  /// already-folded witnesses. The weight table E must be pre-folded and
+  /// passed in (it's shared between NSC and PowerCheck witnesses).
+  pub fn fold_with(&self, other: &Self, E: WeightTable<E>, r_b: &E::Scalar) -> Self {
+    Self {
+      W: self
+        .W
+        .par_iter()
+        .zip(other.W.par_iter())
+        .map(|(a, b)| *a + *r_b * (*b - *a))
+        .collect(),
+      r_W: self.r_W + *r_b * (other.r_W - self.r_W),
+      E,
+    }
   }
 }
 
@@ -194,6 +225,26 @@ impl<E: Engine> FoldedInstance<E> {
       u,
       X,
     })
+  }
+
+  /// Fold two FoldedInstances together
+  ///
+  /// Unlike `fold` which folds with a fresh R1CSInstance, this folds two
+  /// already-folded instances.
+  pub fn fold_with(&self, other: &Self, r_b: &E::Scalar, T_out: &E::Scalar) -> Self {
+    let one_minus_r = E::Scalar::ONE - r_b;
+    Self {
+      comm_W: self.comm_W * one_minus_r + other.comm_W * *r_b,
+      comm_E: self.comm_E * one_minus_r + other.comm_E * *r_b,
+      u: self.u + *r_b * (other.u - self.u),
+      X: self
+        .X
+        .par_iter()
+        .zip(other.X.par_iter())
+        .map(|(a, b)| *a + *r_b * (*b - *a))
+        .collect(),
+      T: *T_out,
+    }
   }
 }
 
@@ -271,16 +322,18 @@ mod tests {
     let mut W = w.W.clone();
     W.resize(S.S.num_vars, E::Scalar::ZERO);
 
+    let r_E = E::Scalar::random(&mut OsRng);
+    let E_table = WeightTable::new(E.clone(), r_E, S.left);
+
     let W = FoldedWitness {
       W,
       r_W: w.r_W,
-      E: E.clone(),
-      r_E: E::Scalar::random(&mut OsRng),
+      E: E_table,
     };
 
     let U = FoldedInstance {
       comm_W: u.comm_W,
-      comm_E: E::CE::commit(&ck, &E, &W.r_E),
+      comm_E: W.E.commit(&ck),
       T: E::Scalar::ZERO,
       X: u.X.clone(),
       u: E::Scalar::ONE,
